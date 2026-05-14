@@ -48,3 +48,17 @@ GitHubに app.py と requirements.txt をアップロードし、Streamlit Cloud
 Streamlit Cloudでは、保存ファイルが永続化されない場合があります。
 本格運用ではSQLite化・クラウドDB化・定期バックアップを推奨します。
 
+
+ にゃんとも相談管理システム Ver1.3
+
+検索・更新・削除対応版です。
+
+- PDF出力
+- AI要約
+- GoogleMap
+- 写真管理
+- 全データ検索
+- 全データ更新
+- 全データ削除
+
+
