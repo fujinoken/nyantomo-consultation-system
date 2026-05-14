@@ -3,14 +3,29 @@ import pandas as pd
 from datetime import date, datetime
 from pathlib import Path
 import uuid
+import io
+from urllib.parse import quote_plus
+
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase import pdfmetrics
+
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.1 基礎設計版
+# にゃんとも相談管理システム Ver1.2
 # ---------------------------------------------------------
-# 目的：
-# ・今は Excel 保存で安定運用
-# ・将来 SQLite 化しやすいように「ID」「カード」「状態遷移」を先に入れる
-# ・診断しない／決めさせない／保留を支える記録システム
+# 追加機能：
+# ・PDF出力
+# ・AI要約用メモ作成
+# ・GoogleMapリンク
+# ・写真管理
+#
+# 方針：
+# ・診断しない
+# ・結論を急がせない
+# ・未確定と保留を分けて記録する
+# ・今はExcel保存で安定運用、将来SQLite化しやすい構造
 # =========================================================
 
 st.set_page_config(
@@ -20,118 +35,46 @@ st.set_page_config(
 )
 
 DATA_FILE = Path("nyantomo_consultation_data.xlsx")
+PHOTO_DIR = Path("photos")
+PHOTO_DIR.mkdir(exist_ok=True)
 
-# ---------------------------------------------------------
-# シート定義
-# ---------------------------------------------------------
 CLIENT_COLUMNS = [
-    "client_id",
-    "登録日時",
-    "お名前",
-    "年代",
-    "地域",
-    "連絡方法",
-    "相談者の立場",
-    "備考",
+    "client_id", "登録日時", "お名前", "年代", "地域", "連絡方法", "相談者の立場", "備考"
 ]
 
 CASE_COLUMNS = [
-    "case_id",
-    "client_id",
-    "登録日時",
-    "相談日",
-    "案件名",
-    "案件種別",
-    "現在ステータス",
-    "今いちばん近い状態",
-    "住まいの状態",
-    "猫との関係",
-    "家族との温度差",
-    "急がされている感じ",
-    "気になること",
-    "今は決めたくないこと",
-    "まず確認したいこと",
-    "自由メモ",
-    "内部メモ",
-    "次回確認すること",
+    "case_id", "client_id", "登録日時", "相談日", "案件名", "案件種別", "現在ステータス",
+    "今いちばん近い状態", "住まいの状態", "猫との関係", "家族との温度差", "急がされている感じ",
+    "気になること", "今は決めたくないこと", "まず確認したいこと", "自由メモ", "内部メモ", "次回確認すること"
 ]
 
 HISTORY_COLUMNS = [
-    "history_id",
-    "case_id",
-    "client_id",
-    "記録日時",
-    "記録日",
-    "記録種別",
-    "状態変更前",
-    "状態変更後",
-    "相談記録",
-    "次回アクション",
-    "内部メモ",
+    "history_id", "case_id", "client_id", "記録日時", "記録日", "記録種別",
+    "状態変更前", "状態変更後", "相談記録", "次回アクション", "内部メモ"
 ]
 
 PROPERTY_COLUMNS = [
-    "property_id",
-    "case_id",
-    "client_id",
-    "登録日時",
-    "物件名",
-    "所在地",
-    "物件状態",
-    "空き家状態",
-    "鍵預かり",
-    "近隣不安",
-    "管理頻度",
-    "メモ",
+    "property_id", "case_id", "client_id", "登録日時", "物件名", "所在地", "物件状態",
+    "空き家状態", "鍵預かり", "近隣不安", "管理頻度", "メモ"
 ]
 
 CAT_COLUMNS = [
-    "cat_id",
-    "case_id",
-    "client_id",
-    "登録日時",
-    "猫の名前",
-    "年齢",
-    "頭数",
-    "現在の暮らし",
-    "気になること",
-    "預け先候補",
-    "メモ",
+    "cat_id", "case_id", "client_id", "登録日時", "猫の名前", "年齢", "頭数",
+    "現在の暮らし", "気になること", "預け先候補", "メモ"
 ]
 
 FAMILY_COLUMNS = [
-    "family_id",
-    "case_id",
-    "client_id",
-    "登録日時",
-    "関係者名",
-    "続柄",
-    "連絡可否",
-    "温度感",
-    "関係メモ",
+    "family_id", "case_id", "client_id", "登録日時", "関係者名", "続柄",
+    "連絡可否", "温度感", "関係メモ"
 ]
 
 PHOTO_COLUMNS = [
-    "photo_id",
-    "case_id",
-    "client_id",
-    "登録日時",
-    "写真種別",
-    "ファイル名",
-    "保存先メモ",
-    "説明",
+    "photo_id", "case_id", "client_id", "登録日時", "写真種別", "ファイル名", "保存先", "説明"
 ]
 
 STATUS_ORDER = [
-    "未対応",
-    "初回相談前",
-    "初回相談済",
-    "情報整理中",
-    "保留中",
-    "見守り中",
-    "継続相談",
-    "専門家紹介済",
-    "終了",
+    "未対応", "初回相談前", "初回相談済", "情報整理中", "保留中",
+    "見守り中", "継続相談", "専門家紹介済", "終了"
 ]
 
 
@@ -175,17 +118,11 @@ def load_all():
 
 
 def get_client_label(row):
-    name = row.get("お名前", "")
-    area = row.get("地域", "")
-    cid = row.get("client_id", "")
-    return f"{name}｜{area}｜{cid}"
+    return f"{row.get('お名前','')}｜{row.get('地域','')}｜{row.get('client_id','')}"
 
 
 def get_case_label(row):
-    title = row.get("案件名", "")
-    status = row.get("現在ステータス", "")
-    case_id = row.get("case_id", "")
-    return f"{title}｜{status}｜{case_id}"
+    return f"{row.get('案件名','')}｜{row.get('現在ステータス','')}｜{row.get('case_id','')}"
 
 
 def selected_id_from_label(label):
@@ -194,13 +131,206 @@ def selected_id_from_label(label):
     return label.split("｜")[-1]
 
 
+def build_case_memo(data, case_id):
+    case_df = data["cases"][data["cases"]["case_id"] == case_id]
+    if case_df.empty:
+        return ""
+    case_row = case_df.iloc[0]
+
+    client_df = data["clients"][data["clients"]["client_id"] == case_row["client_id"]]
+    client_row = client_df.iloc[0] if not client_df.empty else pd.Series(dtype=str)
+
+    history_df = data["history"][data["history"]["case_id"] == case_id]
+    prop_df = data["properties"][data["properties"]["case_id"] == case_id]
+    cat_df = data["cats"][data["cats"]["case_id"] == case_id]
+    fam_df = data["family"][data["family"]["case_id"] == case_id]
+    photo_df = data["photos"][data["photos"]["case_id"] == case_id]
+
+    history_text = "\n".join([
+        f"- {h['記録日']}｜{h['記録種別']}｜{h['状態変更前']} → {h['状態変更後']}｜{h['相談記録']}"
+        for _, h in history_df.iterrows()
+    ]) or "未登録"
+
+    prop_text = "\n".join([
+        f"- {p['物件名']}｜{p['所在地']}｜{p['物件状態']}｜{p['空き家状態']}｜管理頻度：{p['管理頻度']}"
+        for _, p in prop_df.iterrows()
+    ]) or "未登録"
+
+    cat_text = "\n".join([
+        f"- {c['猫の名前']}｜年齢：{c['年齢']}｜頭数：{c['頭数']}｜{c['現在の暮らし']}｜気になること：{c['気になること']}"
+        for _, c in cat_df.iterrows()
+    ]) or "未登録"
+
+    fam_text = "\n".join([
+        f"- {f['関係者名']}｜{f['続柄']}｜{f['温度感']}｜{f['関係メモ']}"
+        for _, f in fam_df.iterrows()
+    ]) or "未登録"
+
+    photo_text = "\n".join([
+        f"- {p['写真種別']}｜{p['ファイル名']}｜{p['説明']}"
+        for _, p in photo_df.iterrows()
+    ]) or "未登録"
+
+    return f"""【にゃんとも相談整理メモ】
+
+作成日：{date.today().strftime('%Y-%m-%d')}
+
+■ 相談者
+お名前：{client_row.get('お名前', '')}
+地域：{client_row.get('地域', '')}
+年代：{client_row.get('年代', '')}
+連絡方法：{client_row.get('連絡方法', '')}
+相談者の立場：{client_row.get('相談者の立場', '')}
+
+■ 案件
+案件名：{case_row['案件名']}
+案件種別：{case_row['案件種別']}
+現在ステータス：{case_row['現在ステータス']}
+相談日：{case_row['相談日']}
+
+■ 今いちばん近い状態
+{case_row['今いちばん近い状態']}
+
+■ 住まいの状態
+{case_row['住まいの状態']}
+
+■ 猫との関係
+{case_row['猫との関係']}
+
+■ 気になること
+{case_row['気になること']}
+
+■ 家族との温度差
+{case_row['家族との温度差']}
+
+■ 急がされている感じ
+{case_row['急がされている感じ']}
+
+■ 今は決めたくないこと
+{case_row['今は決めたくないこと']}
+
+■ まず確認したいこと
+{case_row['まず確認したいこと']}
+
+■ 空き家カード
+{prop_text}
+
+■ 猫情報カード
+{cat_text}
+
+■ 家族関係メモ
+{fam_text}
+
+■ 写真記録
+{photo_text}
+
+■ 相談履歴
+{history_text}
+
+■ 内部メモ
+{case_row['内部メモ']}
+
+■ 次回確認すること
+{case_row['次回確認すること']}
+
+※このメモは、判断を急がせず、状況を整理するための内部記録です。
+※法的判断・医療判断・不動産判断を断定するものではありません。
+"""
+
+
+def build_ai_summary(data, case_id):
+    case_df = data["cases"][data["cases"]["case_id"] == case_id]
+    if case_df.empty:
+        return ""
+    c = case_df.iloc[0]
+    return f"""【AI要約・下書き】
+
+■ 現在の状態
+この案件は「{c['現在ステータス']}」の状態です。
+相談者は「{c['今いちばん近い状態']}」に近く、住まいについては「{c['住まいの状態']}」という状況です。
+
+■ 猫との関係
+{c['猫との関係']}
+
+■ 不安・気になること
+{c['気になること']}
+
+■ 家族との温度差
+{c['家族との温度差']}
+
+■ 急がされている感じ
+{c['急がされている感じ']}
+
+■ いま決めないでよいこと
+{c['今は決めたくないこと']}
+
+■ 次回確認すること
+{c['次回確認すること']}
+
+■ 注意
+この要約は判断を代行するものではありません。
+未確定の内容は未確定のまま扱い、相談者に結論を急がせない前提で確認します。
+"""
+
+
+def build_ai_prompt(memo):
+    return f"""あなたは、にゃんとも相談管理システムの記録整理係です。
+以下の相談メモをもとに、判断を急がせない内部要約を作成してください。
+
+【重要ルール】
+・法的判断、医療判断、不動産判断を断定しない。
+・「売るべき」「貸すべき」「施設に入るべき」などの結論を出さない。
+・事実、未確定、保留、次回確認事項を分ける。
+・相談者を責めない。
+・家族間の温度差を対立として煽らない。
+・猫、住まい、人の暮らしを分断せずに整理する。
+・最後に「次回確認すること」を3つ以内で出す。
+
+【相談メモ】
+{memo}
+"""
+
+
+def make_pdf_bytes(text):
+    buffer = io.BytesIO()
+    pdfmetrics.registerFont(UnicodeCIDFont("HeiseiMin-W3"))
+
+    c = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    x = 40
+    y = height - 45
+    line_height = 14
+    max_chars = 45
+
+    c.setFont("HeiseiMin-W3", 13)
+    c.drawString(x, y, "にゃんとも相談整理メモ")
+    y -= 25
+
+    c.setFont("HeiseiMin-W3", 9)
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line:
+            y -= line_height
+        else:
+            chunks = [line[i:i + max_chars] for i in range(0, len(line), max_chars)]
+            for chunk in chunks:
+                if y < 45:
+                    c.showPage()
+                    c.setFont("HeiseiMin-W3", 9)
+                    y = height - 45
+                c.drawString(x, y, chunk)
+                y -= line_height
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 data = load_all()
 
-# ---------------------------------------------------------
-# 画面
-# ---------------------------------------------------------
-st.title("🐾 にゃんとも相談管理システム Ver1.1")
-st.caption("相談履歴・状態遷移・保留案件・空き家カード・猫情報カードへ拡張できる基礎設計版")
+st.title("🐾 にゃんとも相談管理システム Ver1.2")
+st.caption("PDF出力・AI要約・GoogleMap・写真管理を追加した拡張版")
 
 tabs = st.tabs([
     "🧑 相談者登録",
@@ -208,33 +338,31 @@ tabs = st.tabs([
     "📚 相談履歴",
     "⏸ 保留案件一覧",
     "🏠 空き家カード",
+    "🗺 GoogleMap",
     "🐈 猫情報カード",
     "👪 家族関係メモ",
-    "🧾 相談メモ出力",
+    "📷 写真管理",
+    "🤖 AI要約",
+    "🧾 PDF出力",
     "📦 データ管理",
 ])
 
-# ---------------------------------------------------------
-# 相談者登録
-# ---------------------------------------------------------
+
 with tabs[0]:
     st.subheader("相談者登録")
 
     with st.form("client_form"):
         col1, col2 = st.columns(2)
-
         with col1:
             name = st.text_input("お名前")
             age = st.selectbox("年代", ["未選択", "40代", "50代", "60代", "70代", "80代以上"])
             area = st.text_input("地域")
-
         with col2:
             contact = st.selectbox("連絡方法", ["未選択", "LINE", "メール", "電話", "対面", "その他"])
             position = st.selectbox("相談者の立場", ["未選択", "本人", "家族", "親族", "空き家所有者", "支援者", "その他"])
             note = st.text_area("備考")
 
         submitted = st.form_submit_button("相談者を登録")
-
         if submitted:
             if not name:
                 st.error("お名前を入力してください。")
@@ -256,9 +384,7 @@ with tabs[0]:
     st.divider()
     st.dataframe(data["clients"], use_container_width=True)
 
-# ---------------------------------------------------------
-# 案件登録
-# ---------------------------------------------------------
+
 with tabs[1]:
     st.subheader("案件登録")
 
@@ -272,7 +398,6 @@ with tabs[1]:
             client_id = selected_id_from_label(selected_client_label)
 
             col1, col2 = st.columns(2)
-
             with col1:
                 consult_date = st.date_input("相談日", value=date.today())
                 case_title = st.text_input("案件名", value="住まいと猫の相談")
@@ -280,59 +405,23 @@ with tabs[1]:
                 status = st.selectbox("現在ステータス", STATUS_ORDER, index=1)
                 current_state = st.selectbox(
                     "今いちばん近い状態",
-                    [
-                        "未選択",
-                        "まだ何も決まっていない",
-                        "少し考え始めている",
-                        "家族と話し始めた",
-                        "急かされている感じがある",
-                        "誰にも相談していない",
-                        "すでに困りごとが出ている",
-                    ],
+                    ["未選択", "まだ何も決まっていない", "少し考え始めている", "家族と話し始めた", "急かされている感じがある", "誰にも相談していない", "すでに困りごとが出ている"],
                 )
-
             with col2:
                 house_state = st.selectbox(
                     "住まいの状態",
-                    [
-                        "未選択",
-                        "現在住んでいる",
-                        "空き家になっている",
-                        "近いうちに空き家になりそう",
-                        "相続後そのまま",
-                        "売却・賃貸を迷っている",
-                        "荷物整理が進んでいない",
-                    ],
+                    ["未選択", "現在住んでいる", "空き家になっている", "近いうちに空き家になりそう", "相続後そのまま", "売却・賃貸を迷っている", "荷物整理が進んでいない"],
                 )
                 cat_relation = st.selectbox(
                     "猫との関係",
-                    [
-                        "未選択",
-                        "猫と暮らしている",
-                        "家族の猫がいる",
-                        "猫を残して入院・施設入所が心配",
-                        "これから猫と暮らしたい",
-                        "保護猫に関心がある",
-                        "猫はいない",
-                    ],
+                    ["未選択", "猫と暮らしている", "家族の猫がいる", "猫を残して入院・施設入所が心配", "これから猫と暮らしたい", "保護猫に関心がある", "猫はいない"],
                 )
                 family_gap = st.selectbox("家族との温度差", ["未選択", "特にない", "少しある", "かなりある", "まだ話せていない"])
                 pressure = st.selectbox("急がされている感じ", ["未選択", "ない", "少しある", "強くある", "自分でも焦っている"])
 
             worries = st.multiselect(
                 "気になること",
-                [
-                    "空き家管理",
-                    "相続",
-                    "売却",
-                    "賃貸",
-                    "猫の住まい",
-                    "高齢期の暮らし",
-                    "家族との意見の違い",
-                    "お金",
-                    "近所への不安",
-                    "何から考えればよいか分からない",
-                ],
+                ["空き家管理", "相続", "売却", "賃貸", "猫の住まい", "高齢期の暮らし", "家族との意見の違い", "お金", "近所への不安", "何から考えればよいか分からない"],
             )
 
             not_decide = st.text_area("今は決めたくないこと")
@@ -390,9 +479,7 @@ with tabs[1]:
     st.divider()
     st.dataframe(data["cases"], use_container_width=True)
 
-# ---------------------------------------------------------
-# 相談履歴
-# ---------------------------------------------------------
+
 with tabs[2]:
     st.subheader("相談履歴・状態変更")
 
@@ -427,7 +514,6 @@ with tabs[2]:
 
                 if submitted:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
                     new_history = {
                         "history_id": make_id("hist"),
                         "case_id": case_id,
@@ -441,22 +527,17 @@ with tabs[2]:
                         "次回アクション": next_action,
                         "内部メモ": internal,
                     }
-
                     data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
                     data["cases"].loc[data["cases"]["case_id"] == case_id, "現在ステータス"] = new_status
                     save_all(data)
                     st.success("相談履歴を追加しました。")
 
         st.divider()
-        history_df = data["history"][data["history"]["case_id"] == case_id]
-        st.dataframe(history_df, use_container_width=True)
+        st.dataframe(data["history"][data["history"]["case_id"] == case_id], use_container_width=True)
 
-# ---------------------------------------------------------
-# 保留案件一覧
-# ---------------------------------------------------------
+
 with tabs[3]:
     st.subheader("保留案件一覧")
-
     if data["cases"].empty:
         st.info("案件がありません。")
     else:
@@ -466,9 +547,7 @@ with tabs[3]:
         else:
             st.dataframe(hold_df, use_container_width=True)
 
-# ---------------------------------------------------------
-# 空き家カード
-# ---------------------------------------------------------
+
 with tabs[4]:
     st.subheader("空き家カード")
 
@@ -518,10 +597,25 @@ with tabs[4]:
         st.divider()
         st.dataframe(data["properties"][data["properties"]["case_id"] == case_id], use_container_width=True)
 
-# ---------------------------------------------------------
-# 猫情報カード
-# ---------------------------------------------------------
+
 with tabs[5]:
+    st.subheader("GoogleMap")
+    st.caption("空き家カードの所在地からGoogleMapを開けます。APIキー不要の簡易版です。")
+
+    if data["properties"].empty:
+        st.info("空き家カードに所在地を登録すると、ここに表示されます。")
+    else:
+        for _, row in data["properties"].iterrows():
+            address = row["所在地"]
+            if address:
+                map_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(address)}"
+                with st.container(border=True):
+                    st.write(f"物件名：{row['物件名']}")
+                    st.write(f"所在地：{address}")
+                    st.link_button("GoogleMapで開く", map_url)
+
+
+with tabs[6]:
     st.subheader("猫情報カード")
 
     if data["cases"].empty:
@@ -568,10 +662,8 @@ with tabs[5]:
         st.divider()
         st.dataframe(data["cats"][data["cats"]["case_id"] == case_id], use_container_width=True)
 
-# ---------------------------------------------------------
-# 家族関係メモ
-# ---------------------------------------------------------
-with tabs[6]:
+
+with tabs[7]:
     st.subheader("家族関係メモ")
 
     if data["cases"].empty:
@@ -614,116 +706,116 @@ with tabs[6]:
         st.divider()
         st.dataframe(data["family"][data["family"]["case_id"] == case_id], use_container_width=True)
 
-# ---------------------------------------------------------
-# 相談メモ出力
-# ---------------------------------------------------------
-with tabs[7]:
-    st.subheader("相談メモ出力")
+
+with tabs[8]:
+    st.subheader("写真管理")
+    st.caption("現地写真、猫写真、書類写真などを案件ごとに保存します。")
+
+    if data["cases"].empty:
+        st.info("先に案件を登録してください。")
+    else:
+        case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
+        selected_case_label = st.selectbox("案件選択（写真管理）", case_labels)
+        case_id = selected_id_from_label(selected_case_label)
+        case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
+        client_id = case_row["client_id"]
+
+        photo_type = st.selectbox("写真種別", ["外観", "室内", "郵便受け", "庭", "猫", "書類", "その他"])
+        description = st.text_area("写真説明")
+        uploaded_files = st.file_uploader(
+            "写真をアップロード",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True
+        )
+
+        if st.button("写真を保存"):
+            if not uploaded_files:
+                st.error("写真を選択してください。")
+            else:
+                rows = []
+                for uploaded in uploaded_files:
+                    suffix = Path(uploaded.name).suffix.lower()
+                    photo_id = make_id("photo")
+                    safe_name = f"{photo_id}{suffix}"
+                    save_path = PHOTO_DIR / safe_name
+                    save_path.write_bytes(uploaded.getbuffer())
+
+                    rows.append({
+                        "photo_id": photo_id,
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "登録日時": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "写真種別": photo_type,
+                        "ファイル名": uploaded.name,
+                        "保存先": str(save_path),
+                        "説明": description,
+                    })
+
+                data["photos"] = pd.concat([data["photos"], pd.DataFrame(rows)], ignore_index=True)
+                save_all(data)
+                st.success("写真を保存しました。")
+
+        st.divider()
+        photo_df = data["photos"][data["photos"]["case_id"] == case_id]
+        st.dataframe(photo_df, use_container_width=True)
+
+        for _, p in photo_df.iterrows():
+            path = Path(p["保存先"])
+            if path.exists():
+                with st.container(border=True):
+                    st.write(f"{p['写真種別']}：{p['ファイル名']}")
+                    st.write(p["説明"])
+                    st.image(str(path), width=350)
+
+
+with tabs[9]:
+    st.subheader("AI要約")
+    st.caption("外部AIに送る前の安全な下書きと、コピー用プロンプトを作成します。")
 
     if data["cases"].empty:
         st.info("案件がありません。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（メモ出力）", case_labels)
+        selected_case_label = st.selectbox("案件選択（AI要約）", case_labels)
         case_id = selected_id_from_label(selected_case_label)
 
-        case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
-        client_row = data["clients"][data["clients"]["client_id"] == case_row["client_id"]].iloc[0]
+        memo = build_case_memo(data, case_id)
+        summary = build_ai_summary(data, case_id)
+        prompt = build_ai_prompt(memo)
 
-        history_df = data["history"][data["history"]["case_id"] == case_id]
-        prop_df = data["properties"][data["properties"]["case_id"] == case_id]
-        cat_df = data["cats"][data["cats"]["case_id"] == case_id]
-        fam_df = data["family"][data["family"]["case_id"] == case_id]
+        st.markdown("### 自動要約下書き")
+        st.text_area("AI要約・下書き", summary, height=350)
 
-        history_text = ""
-        for _, h in history_df.iterrows():
-            history_text += f"- {h['記録日']}｜{h['記録種別']}｜{h['状態変更前']} → {h['状態変更後']}｜{h['相談記録']}\n"
+        st.markdown("### AIに貼り付ける用プロンプト")
+        st.text_area("コピー用プロンプト", prompt, height=500)
 
-        prop_text = ""
-        for _, p in prop_df.iterrows():
-            prop_text += f"- {p['物件名']}｜{p['所在地']}｜{p['物件状態']}｜{p['空き家状態']}\n"
+        st.warning("個人情報を外部AIへ入力する場合は、匿名化・伏せ字化してから使用してください。")
 
-        cat_text = ""
-        for _, c in cat_df.iterrows():
-            cat_text += f"- {c['猫の名前']}｜{c['年齢']}｜{c['頭数']}｜{c['現在の暮らし']}\n"
 
-        fam_text = ""
-        for _, f in fam_df.iterrows():
-            fam_text += f"- {f['関係者名']}｜{f['続柄']}｜{f['温度感']}｜{f['関係メモ']}\n"
+with tabs[10]:
+    st.subheader("PDF出力")
 
-        memo = f"""
-【にゃんとも相談整理メモ】
+    if data["cases"].empty:
+        st.info("案件がありません。")
+    else:
+        case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
+        selected_case_label = st.selectbox("案件選択（PDF出力）", case_labels)
+        case_id = selected_id_from_label(selected_case_label)
 
-作成日：{date.today().strftime('%Y-%m-%d')}
+        memo = build_case_memo(data, case_id)
+        st.text_area("PDF化する相談整理メモ", memo, height=500)
 
-■ 相談者
-お名前：{client_row['お名前']}
-地域：{client_row['地域']}
-年代：{client_row['年代']}
-連絡方法：{client_row['連絡方法']}
-相談者の立場：{client_row['相談者の立場']}
+        pdf_bytes = make_pdf_bytes(memo)
+        st.download_button(
+            "PDFをダウンロード",
+            data=pdf_bytes,
+            file_name=f"nyantomo_memo_{case_id}.pdf",
+            mime="application/pdf",
+        )
 
-■ 案件
-案件名：{case_row['案件名']}
-案件種別：{case_row['案件種別']}
-現在ステータス：{case_row['現在ステータス']}
-相談日：{case_row['相談日']}
 
-■ 今いちばん近い状態
-{case_row['今いちばん近い状態']}
-
-■ 住まいの状態
-{case_row['住まいの状態']}
-
-■ 猫との関係
-{case_row['猫との関係']}
-
-■ 気になること
-{case_row['気になること']}
-
-■ 家族との温度差
-{case_row['家族との温度差']}
-
-■ 急がされている感じ
-{case_row['急がされている感じ']}
-
-■ 今は決めたくないこと
-{case_row['今は決めたくないこと']}
-
-■ まず確認したいこと
-{case_row['まず確認したいこと']}
-
-■ 空き家カード
-{prop_text if prop_text else '未登録'}
-
-■ 猫情報カード
-{cat_text if cat_text else '未登録'}
-
-■ 家族関係メモ
-{fam_text if fam_text else '未登録'}
-
-■ 相談履歴
-{history_text if history_text else '未登録'}
-
-■ 内部メモ
-{case_row['内部メモ']}
-
-■ 次回確認すること
-{case_row['次回確認すること']}
-
-※このメモは、判断を急がせず、状況を整理するための内部記録です。
-※法的判断・医療判断・不動産判断を断定するものではありません。
-"""
-
-        st.text_area("相談整理メモ", memo, height=700)
-
-# ---------------------------------------------------------
-# データ管理
-# ---------------------------------------------------------
-with tabs[8]:
+with tabs[11]:
     st.subheader("データ管理")
-
-    st.write("Excel保存ファイル：", DATA_FILE.name)
 
     if DATA_FILE.exists():
         with open(DATA_FILE, "rb") as f:
@@ -734,24 +826,10 @@ with tabs[8]:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-    st.divider()
-
-    st.markdown("### 将来拡張メモ")
+    st.markdown("### 注意")
     st.write(
         """
-        このVer1.1は、次の拡張を想定した構造です。
-
-        - 相談履歴管理：historyシート
-        - 状態遷移：casesの現在ステータス＋historyの状態変更前後
-        - 保留案件一覧：保留中・情報整理中・見守り中を抽出
-        - LINE連携：client_id / case_id をキーに外部連携可能
-        - AI要約：相談メモ出力をAIに渡す前提
-        - PDF出力：相談整理メモをPDF化する前提
-        - 空き家カード：propertiesシート
-        - 猫情報カード：catsシート
-        - 家族関係図：familyシート
-        - GoogleMap連携：所在地カラムを使用
-        - 写真保存：photosシートを将来利用
-        - SQLite化：各シートをそのままテーブル化可能
+        Streamlit Cloudでは、無料環境の仕様により保存データが永続化されない場合があります。
+        本格運用前には、SQLite化、クラウドDB化、または定期バックアップを行う前提で使ってください。
         """
     )
