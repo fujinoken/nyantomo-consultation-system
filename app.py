@@ -549,6 +549,178 @@ def render_search_update_delete(data):
     return data
 
 
+
+# ---------------------------------------------------------
+# Ver1.4 追加：案件起点ダッシュボード
+# ---------------------------------------------------------
+def render_case_dashboard(data):
+    st.subheader("🗂 案件ダッシュボード")
+    st.caption("case_idを中心に、相談者・履歴・空き家・猫・家族・写真を一画面で確認します。ゴールはステータスを『終了』まで進めることです。")
+
+    if data["cases"].empty:
+        st.info("先に案件を登録してください。")
+        return data
+
+    active_only = st.checkbox("終了以外の案件だけ表示", value=True)
+    case_df = data["cases"].copy()
+    if active_only:
+        case_df = case_df[case_df["現在ステータス"] != "終了"]
+
+    if case_df.empty:
+        st.success("表示対象の案件はありません。")
+        return data
+
+    status_filter = st.multiselect(
+        "ステータスで絞り込み",
+        STATUS_ORDER,
+        default=[]
+    )
+    if status_filter:
+        case_df = case_df[case_df["現在ステータス"].isin(status_filter)]
+
+    keyword = st.text_input("案件検索", placeholder="案件名・気になること・メモなど")
+    case_df = filter_df_keyword(case_df, keyword)
+
+    if case_df.empty:
+        st.info("条件に合う案件がありません。")
+        return data
+
+    case_labels = [get_case_label(row) for _, row in case_df.iterrows()]
+    selected_case_label = st.selectbox("案件を選択", case_labels)
+    case_id = selected_id_from_label(selected_case_label)
+
+    case_rows = data["cases"][data["cases"]["case_id"] == case_id]
+    if case_rows.empty:
+        st.error("案件が見つかりません。")
+        return data
+
+    case_row = case_rows.iloc[0]
+    client_id = case_row["client_id"]
+    client_rows = data["clients"][data["clients"]["client_id"] == client_id]
+    client_row = client_rows.iloc[0] if not client_rows.empty else pd.Series(dtype=str)
+
+    status = str(case_row.get("現在ステータス", ""))
+    try:
+        progress = int((STATUS_ORDER.index(status) + 1) / len(STATUS_ORDER) * 100)
+    except ValueError:
+        progress = 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("現在ステータス", status)
+    col2.metric("相談者", str(client_row.get("お名前", "未登録")))
+    col3.metric("案件種別", str(case_row.get("案件種別", "")))
+    col4.metric("終了までの目安", f"{progress}%")
+    st.progress(progress)
+
+    with st.container(border=True):
+        st.markdown("### 案件の現在地")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write(f"**案件名：** {case_row.get('案件名','')}")
+            st.write(f"**相談日：** {case_row.get('相談日','')}")
+            st.write(f"**今いちばん近い状態：** {case_row.get('今いちばん近い状態','')}")
+            st.write(f"**住まいの状態：** {case_row.get('住まいの状態','')}")
+        with c2:
+            st.write(f"**猫との関係：** {case_row.get('猫との関係','')}")
+            st.write(f"**家族との温度差：** {case_row.get('家族との温度差','')}")
+            st.write(f"**急がされている感じ：** {case_row.get('急がされている感じ','')}")
+            st.write(f"**次回確認すること：** {case_row.get('次回確認すること','')}")
+
+    st.markdown("### 状態を進める")
+    with st.form(f"casehub_status_form_{case_id}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            new_status = st.selectbox(
+                "新しいステータス",
+                STATUS_ORDER,
+                index=STATUS_ORDER.index(status) if status in STATUS_ORDER else 0,
+            )
+            record_date = st.date_input("記録日", value=date.today(), key=f"casehub_record_date_{case_id}")
+        with c2:
+            record_type = st.selectbox("記録種別", ["状態変更", "相談", "電話", "LINE", "メール", "面談", "現地確認", "終了確認", "その他"])
+            next_action = st.text_area("次回アクション")
+        record = st.text_area("相談記録・判断保留の理由・確認した事実")
+        internal = st.text_area("内部メモ")
+        submitted = st.form_submit_button("履歴を追加してステータス更新")
+        if submitted:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            new_history = {
+                "history_id": make_id("hist"),
+                "case_id": case_id,
+                "client_id": client_id,
+                "記録日時": now,
+                "記録日": record_date.strftime("%Y-%m-%d"),
+                "記録種別": record_type,
+                "状態変更前": status,
+                "状態変更後": new_status,
+                "相談記録": record,
+                "次回アクション": next_action,
+                "内部メモ": internal,
+            }
+            data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
+            data["cases"].loc[data["cases"]["case_id"] == case_id, "現在ステータス"] = new_status
+            data["cases"].loc[data["cases"]["case_id"] == case_id, "次回確認すること"] = next_action
+            save_all(data)
+            st.success("履歴を追加し、案件ステータスを更新しました。")
+            st.rerun()
+
+    st.divider()
+    st.markdown("### この案件に紐づくデータ")
+    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "AI/PDF用メモ"])
+
+    with rel_tabs[0]:
+        st.dataframe(client_rows, use_container_width=True)
+
+    with rel_tabs[1]:
+        h = data["history"][data["history"]["case_id"] == case_id].copy()
+        if h.empty:
+            st.info("相談履歴はまだありません。")
+        else:
+            st.dataframe(h, use_container_width=True)
+
+    with rel_tabs[2]:
+        p_df = data["properties"][data["properties"]["case_id"] == case_id].copy()
+        st.dataframe(p_df, use_container_width=True)
+        for _, row in p_df.iterrows():
+            address = row.get("所在地", "")
+            if address:
+                map_url = f"https://www.google.com/maps/search/?api=1&query={quote_plus(address)}"
+                st.link_button(f"GoogleMapで開く：{row.get('物件名','物件')}", map_url)
+
+    with rel_tabs[3]:
+        st.dataframe(data["cats"][data["cats"]["case_id"] == case_id], use_container_width=True)
+
+    with rel_tabs[4]:
+        st.dataframe(data["family"][data["family"]["case_id"] == case_id], use_container_width=True)
+
+    with rel_tabs[5]:
+        photo_df = data["photos"][data["photos"]["case_id"] == case_id].copy()
+        st.dataframe(photo_df, use_container_width=True)
+        for _, p in photo_df.iterrows():
+            path = Path(str(p.get("保存先", "")))
+            if path.exists():
+                with st.container(border=True):
+                    st.write(f"{p.get('写真種別','')}：{p.get('ファイル名','')}")
+                    st.write(p.get("説明", ""))
+                    st.image(str(path), width=350)
+
+    with rel_tabs[6]:
+        memo = build_case_memo(data, case_id)
+        st.text_area("案件統合メモ", memo, height=500)
+        pdf_bytes = make_pdf_bytes(memo)
+        st.download_button(
+            "この案件のPDFをダウンロード",
+            data=pdf_bytes,
+            file_name=f"nyantomo_case_{case_id}.pdf",
+            mime="application/pdf",
+        )
+
+    st.divider()
+    st.markdown("### 案件一覧")
+    st.dataframe(case_df, use_container_width=True)
+
+    return data
+
 data = load_all()
 
 st.title("🐾 にゃんとも相談管理システム Ver1.3")
@@ -557,6 +729,7 @@ st.caption("相談を保留のまま管理する現場OS｜検索・更新・削
 tabs = st.tabs([
     "🧑 相談者登録",
     "📝 案件登録",
+    "🗂 案件ダッシュボード",
     "📚 相談履歴",
     "⏸ 保留案件一覧",
     "🏠 空き家カード",
@@ -704,6 +877,9 @@ with tabs[1]:
 
 
 with tabs[2]:
+    data = render_case_dashboard(data)
+
+with tabs[3]:
     st.subheader("相談履歴・状態変更")
 
     if data["cases"].empty:
@@ -759,7 +935,7 @@ with tabs[2]:
         st.dataframe(data["history"][data["history"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("保留案件一覧")
     if data["cases"].empty:
         st.info("案件がありません。")
@@ -771,7 +947,7 @@ with tabs[3]:
             st.dataframe(hold_df, use_container_width=True)
 
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("空き家カード")
 
     if data["cases"].empty:
@@ -821,7 +997,7 @@ with tabs[4]:
         st.dataframe(data["properties"][data["properties"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("GoogleMap")
     st.caption("空き家カードの所在地からGoogleMapを開けます。APIキー不要の簡易版です。")
 
@@ -838,7 +1014,7 @@ with tabs[5]:
                     st.link_button("GoogleMapで開く", map_url)
 
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("猫情報カード")
 
     if data["cases"].empty:
@@ -886,7 +1062,7 @@ with tabs[6]:
         st.dataframe(data["cats"][data["cats"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("家族関係メモ")
 
     if data["cases"].empty:
@@ -930,7 +1106,7 @@ with tabs[7]:
         st.dataframe(data["family"][data["family"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[8]:
+with tabs[9]:
     st.subheader("写真管理")
     st.caption("現地写真、猫写真、書類写真などを案件ごとに保存します。")
 
@@ -991,7 +1167,7 @@ with tabs[8]:
                     st.image(str(path), width=350)
 
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("AI要約")
     st.caption("外部AIに送る前の安全な下書きと、コピー用プロンプトを作成します。")
 
@@ -1015,7 +1191,7 @@ with tabs[9]:
         st.warning("個人情報を外部AIへ入力する場合は、匿名化・伏せ字化してから使用してください。")
 
 
-with tabs[10]:
+with tabs[11]:
     st.subheader("PDF出力")
 
     if data["cases"].empty:
@@ -1037,11 +1213,11 @@ with tabs[10]:
         )
 
 
-with tabs[11]:
+with tabs[12]:
     data = render_search_update_delete(data)
 
 
-with tabs[12]:
+with tabs[13]:
     st.subheader("データ管理")
 
     if DATA_FILE.exists():
