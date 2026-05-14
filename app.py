@@ -586,7 +586,7 @@ def render_case_dashboard(data):
         return data
 
     case_labels = [get_case_label(row) for _, row in case_df.iterrows()]
-    selected_case_label = st.selectbox("案件を選択", case_labels)
+    selected_case_label = st.selectbox("案件を選択", case_labels, key="casehub_select_case")
     case_id = selected_id_from_label(selected_case_label)
 
     case_rows = data["cases"][data["cases"]["case_id"] == case_id]
@@ -637,10 +637,10 @@ def render_case_dashboard(data):
             )
             record_date = st.date_input("記録日", value=date.today(), key=f"casehub_record_date_{case_id}")
         with c2:
-            record_type = st.selectbox("記録種別", ["状態変更", "相談", "電話", "LINE", "メール", "面談", "現地確認", "終了確認", "その他"])
-            next_action = st.text_area("次回アクション")
-        record = st.text_area("相談記録・判断保留の理由・確認した事実")
-        internal = st.text_area("内部メモ")
+            record_type = st.selectbox("記録種別", ["状態変更", "相談", "電話", "LINE", "メール", "面談", "現地確認", "終了確認", "その他"], key=f"casehub_record_type_{case_id}")
+            next_action = st.text_area("次回アクション", key=f"casehub_next_action_{case_id}")
+        record = st.text_area("相談記録・判断保留の理由・確認した事実", key=f"casehub_record_{case_id}")
+        internal = st.text_area("内部メモ", key=f"casehub_internal_{case_id}")
         submitted = st.form_submit_button("履歴を追加してステータス更新")
         if submitted:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -886,7 +886,7 @@ with tabs[3]:
         st.info("先に案件を登録してください。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件を選択", case_labels)
+        selected_case_label = st.selectbox("案件を選択", case_labels, key="history_select_case")
         case_id = selected_id_from_label(selected_case_label)
 
         case_rows = data["cases"][data["cases"]["case_id"] == case_id]
@@ -900,14 +900,14 @@ with tabs[3]:
             with st.form("history_form"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    record_date = st.date_input("記録日", value=date.today())
-                    record_type = st.selectbox("記録種別", ["相談", "電話", "LINE", "メール", "面談", "現地確認", "状態変更", "その他"])
+                    record_date = st.date_input("記録日", value=date.today(), key=f"history_record_date_{case_id}")
+                    record_type = st.selectbox("記録種別", ["相談", "電話", "LINE", "メール", "面談", "現地確認", "状態変更", "その他"], key=f"history_record_type_{case_id}")
                 with col2:
-                    new_status = st.selectbox("状態変更後", STATUS_ORDER, index=STATUS_ORDER.index(current_status) if current_status in STATUS_ORDER else 0)
+                    new_status = st.selectbox("状態変更後", STATUS_ORDER, index=STATUS_ORDER.index(current_status) if current_status in STATUS_ORDER else 0, key=f"history_new_status_{case_id}")
 
-                record = st.text_area("相談記録")
-                next_action = st.text_area("次回アクション")
-                internal = st.text_area("内部メモ")
+                record = st.text_area("相談記録", key=f"history_record_{case_id}")
+                next_action = st.text_area("次回アクション", key=f"history_next_action_{case_id}")
+                internal = st.text_area("内部メモ", key=f"history_internal_{case_id}")
 
                 submitted = st.form_submit_button("履歴を追加")
 
