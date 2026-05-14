@@ -28,3 +28,23 @@ GitHubに app.py と requirements.txt をアップロードし、Streamlit Cloud
 - GoogleMap連携
 - 写真保存
 - SQLite化
+
+- # にゃんとも相談管理システム Ver1.2
+
+## 追加機能
+- PDF出力
+- AI要約用メモ作成
+- GoogleMapリンク
+- 写真管理
+
+## ファイル
+- app.py
+- requirements.txt
+
+## Streamlit Cloud
+GitHubに app.py と requirements.txt をアップロードし、Streamlit Cloudで app.py を指定してデプロイします。
+
+## 注意
+Streamlit Cloudでは、保存ファイルが永続化されない場合があります。
+本格運用ではSQLite化・クラウドDB化・定期バックアップを推奨します。
+
