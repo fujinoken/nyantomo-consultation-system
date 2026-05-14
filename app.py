@@ -13,7 +13,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.5
+# にゃんとも相談管理システム Ver1.6
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -551,7 +551,7 @@ def render_search_update_delete(data):
 
 
 # ---------------------------------------------------------
-# Ver1.5 追加：案件ホーム・タイムライン・停滞確認
+# Ver1.6 追加：業務改善ダッシュボード・次アクション・入力不足チェック
 # ---------------------------------------------------------
 
 def parse_date_safe(value):
@@ -667,14 +667,8 @@ def build_case_timeline(data, case_id):
     return timeline.fillna("")
 
 
-def render_case_home(data):
-    st.subheader("🏡 案件ホーム")
-    st.caption("案件を起点に、止まっている案件・次に確認する案件・終了した案件を見渡します。")
-
-    if data["cases"].empty:
-        st.info("まだ案件がありません。先に相談者登録・案件登録をしてください。")
-        return data
-
+def build_case_home_dataframe(data):
+    """案件ホーム用の一覧を作る。Excel保存のままでも業務判断しやすいように集約する。"""
     rows = []
     today = date.today()
     for _, c in data["cases"].iterrows():
@@ -684,48 +678,138 @@ def render_case_home(data):
         client_name = client_rows.iloc[0].get("お名前", "") if not client_rows.empty else ""
         latest = latest_case_activity_date(data, case_id)
         days = (today - latest).days if latest else None
+
+        prop_count = len(data["properties"][data["properties"]["case_id"] == case_id]) if not data["properties"].empty else 0
+        cat_count = len(data["cats"][data["cats"]["case_id"] == case_id]) if not data["cats"].empty else 0
+        family_count = len(data["family"][data["family"]["case_id"] == case_id]) if not data["family"].empty else 0
+        history_count = len(data["history"][data["history"]["case_id"] == case_id]) if not data["history"].empty else 0
+
+        missing = []
+        if not str(c.get("次回確認すること", "")).strip():
+            missing.append("次回確認")
+        if prop_count == 0 and c.get("住まいの状態", "") in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま", "売却・賃貸を迷っている"]:
+            missing.append("空き家カード")
+        if cat_count == 0 and c.get("猫との関係", "") not in ["未選択", "猫はいない", ""]:
+            missing.append("猫情報")
+        if family_count == 0 and c.get("家族との温度差", "") in ["少しある", "かなりある", "まだ話せていない"]:
+            missing.append("家族メモ")
+
+        status = c.get("現在ステータス", "")
+        if status == "終了":
+            next_action_label = "終了済"
+        elif days is None:
+            next_action_label = "まず初回記録を確認"
+        elif days >= 90:
+            next_action_label = "継続要否を確認"
+        elif days >= 60:
+            next_action_label = "近況確認の候補"
+        elif days >= 30:
+            next_action_label = "静かに確認"
+        elif str(c.get("次回確認すること", "")).strip():
+            next_action_label = "次回確認あり"
+        else:
+            next_action_label = "保留継続"
+
+        if status == "終了":
+            priority = "完了"
+        elif days is not None and days >= 90:
+            priority = "高"
+        elif days is not None and days >= 60:
+            priority = "中"
+        elif missing:
+            priority = "確認"
+        else:
+            priority = "通常"
+
         rows.append({
+            "優先": priority,
+            "次アクション": next_action_label,
             "案件名": c.get("案件名", ""),
             "相談者": client_name,
-            "現在ステータス": c.get("現在ステータス", ""),
+            "現在ステータス": status,
             "案件種別": c.get("案件種別", ""),
             "最終更新": latest.strftime("%Y-%m-%d") if latest else "",
             "未更新日数": days if days is not None else "",
             "静かな確認": case_silent_status(days),
+            "入力不足": "、".join(missing),
             "次回確認すること": c.get("次回確認すること", ""),
+            "履歴数": history_count,
+            "空き家": prop_count,
+            "猫": cat_count,
+            "家族": family_count,
             "case_id": case_id,
         })
+    return pd.DataFrame(rows)
 
-    home_df = pd.DataFrame(rows)
 
-    c1, c2, c3, c4 = st.columns(4)
+def render_case_home(data):
+    st.subheader("🏡 案件ホーム Ver1.6")
+    st.caption("今日見るべき案件、止まっている案件、入力が足りない案件を一画面で確認します。")
+
+    if data["cases"].empty:
+        st.info("まだ案件がありません。先に相談者登録・案件登録をしてください。")
+        return data
+
+    home_df = build_case_home_dataframe(data)
+
+    active_df = home_df[home_df["現在ステータス"] != "終了"]
+    high_df = active_df[active_df["優先"].isin(["高", "中"])]
+    missing_df = active_df[active_df["入力不足"].astype(str).str.len() > 0]
+    next_df = active_df[active_df["次アクション"].isin(["次回確認あり", "静かに確認", "近況確認の候補", "継続要否を確認", "まず初回記録を確認"])]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("全案件", len(home_df))
-    c2.metric("進行中", len(home_df[home_df["現在ステータス"] != "終了"]))
-    c3.metric("終了", len(home_df[home_df["現在ステータス"] == "終了"]))
-    c4.metric("30日以上未更新", len(home_df[home_df["静かな確認"].isin(["30日以上未更新", "60日以上未更新", "90日以上未更新"])]))
+    c2.metric("進行中", len(active_df))
+    c3.metric("今日見る候補", len(next_df))
+    c4.metric("60日以上未更新", len(high_df))
+    c5.metric("入力不足", len(missing_df))
 
-    show_active = st.checkbox("終了以外を中心に見る", value=True, key="home_active_only")
+    st.markdown("### 今日見る案件")
+    if next_df.empty:
+        st.success("今日すぐ確認すべき案件はありません。")
+    else:
+        st.dataframe(
+            next_df[["優先", "次アクション", "案件名", "相談者", "現在ステータス", "未更新日数", "入力不足", "次回確認すること", "case_id"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("入力不足チェック", expanded=not missing_df.empty):
+        st.caption("急がせるためではなく、記録の穴をなくして安心して保留するための確認です。")
+        if missing_df.empty:
+            st.success("大きな入力不足は見つかりません。")
+        else:
+            st.dataframe(
+                missing_df[["案件名", "相談者", "現在ステータス", "入力不足", "空き家", "猫", "家族", "case_id"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+    st.markdown("### 案件一覧")
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    with col_a:
+        show_active = st.checkbox("終了以外を中心に見る", value=True, key="home_active_only")
+    with col_b:
+        priority_filter = st.multiselect("優先度", ["高", "中", "確認", "通常", "完了"], default=[], key="home_priority_filter")
+    with col_c:
+        keyword = st.text_input("案件ホーム検索", placeholder="案件名・相談者・次回確認など", key="home_keyword")
+
     view_df = home_df.copy()
     if show_active:
         view_df = view_df[view_df["現在ステータス"] != "終了"]
+    if priority_filter:
+        view_df = view_df[view_df["優先"].isin(priority_filter)]
 
     status_filter = st.multiselect("ステータス絞り込み", STATUS_ORDER, default=[], key="home_status_filter")
     if status_filter:
         view_df = view_df[view_df["現在ステータス"].isin(status_filter)]
-
-    keyword = st.text_input("案件ホーム検索", placeholder="案件名・相談者・次回確認など", key="home_keyword")
     view_df = filter_df_keyword(view_df, keyword)
 
-    st.markdown("### 案件一覧")
-    st.dataframe(view_df, use_container_width=True)
+    st.dataframe(view_df, use_container_width=True, hide_index=True)
 
-    st.markdown("### 静かな確認が必要な案件")
-    alert_df = view_df[view_df["静かな確認"].isin(["30日以上未更新", "60日以上未更新", "90日以上未更新"])]
-    if alert_df.empty:
-        st.success("大きく止まっている案件はありません。")
-    else:
-        st.info("急がせるためではなく、確認のきっかけとして表示しています。")
-        st.dataframe(alert_df, use_container_width=True)
+    st.markdown("### 業務改善メモ")
+    st.info("Ver1.6では、案件を“探す”時間を減らし、今日見る案件・入力不足・止まっている案件を先に出す設計にしています。")
 
     return data
 
@@ -737,7 +821,7 @@ def render_case_dashboard(data):
         st.info("先に案件を登録してください。")
         return data
 
-    active_only = st.checkbox("終了以外の案件だけ表示", value=True)
+    active_only = st.checkbox("終了以外の案件だけ表示", value=True, key="casehub_active_only")
     case_df = data["cases"].copy()
     if active_only:
         case_df = case_df[case_df["現在ステータス"] != "終了"]
@@ -749,12 +833,13 @@ def render_case_dashboard(data):
     status_filter = st.multiselect(
         "ステータスで絞り込み",
         STATUS_ORDER,
-        default=[]
+        default=[],
+        key="casehub_status_filter"
     )
     if status_filter:
         case_df = case_df[case_df["現在ステータス"].isin(status_filter)]
 
-    keyword = st.text_input("案件検索", placeholder="案件名・気になること・メモなど")
+    keyword = st.text_input("案件検索", placeholder="案件名・気になること・メモなど", key="casehub_keyword")
     case_df = filter_df_keyword(case_df, keyword)
 
     if case_df.empty:
@@ -921,8 +1006,8 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.5")
-st.caption("相談を保留のまま管理する現場OS｜案件起点・タイムライン・停滞確認対応版")
+st.title("🐾 にゃんとも相談管理システム Ver1.6")
+st.caption("相談を保留のまま管理する現場OS｜案件起点・次アクション・入力不足チェック対応版")
 
 tabs = st.tabs([
     "🏡 案件ホーム",
@@ -1157,7 +1242,7 @@ with tabs[6]:
         st.info("先に案件を登録してください。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（空き家カード）", case_labels)
+        selected_case_label = st.selectbox("案件選択（空き家カード）", case_labels, key="property_select_case")
         case_id = selected_id_from_label(selected_case_label)
         case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
         client_id = case_row["client_id"]
@@ -1224,7 +1309,7 @@ with tabs[8]:
         st.info("先に案件を登録してください。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（猫情報カード）", case_labels)
+        selected_case_label = st.selectbox("案件選択（猫情報カード）", case_labels, key="cat_select_case")
         case_id = selected_id_from_label(selected_case_label)
         case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
         client_id = case_row["client_id"]
@@ -1272,7 +1357,7 @@ with tabs[9]:
         st.info("先に案件を登録してください。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（家族関係メモ）", case_labels)
+        selected_case_label = st.selectbox("案件選択（家族関係メモ）", case_labels, key="family_select_case")
         case_id = selected_id_from_label(selected_case_label)
         case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
         client_id = case_row["client_id"]
@@ -1317,7 +1402,7 @@ with tabs[10]:
         st.info("先に案件を登録してください。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（写真管理）", case_labels)
+        selected_case_label = st.selectbox("案件選択（写真管理）", case_labels, key="photo_select_case")
         case_id = selected_id_from_label(selected_case_label)
         case_row = data["cases"][data["cases"]["case_id"] == case_id].iloc[0]
         client_id = case_row["client_id"]
@@ -1378,7 +1463,7 @@ with tabs[11]:
         st.info("案件がありません。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（AI要約）", case_labels)
+        selected_case_label = st.selectbox("案件選択（AI要約）", case_labels, key="ai_select_case")
         case_id = selected_id_from_label(selected_case_label)
 
         memo = build_case_memo(data, case_id)
@@ -1401,7 +1486,7 @@ with tabs[12]:
         st.info("案件がありません。")
     else:
         case_labels = [get_case_label(row) for _, row in data["cases"].iterrows()]
-        selected_case_label = st.selectbox("案件選択（PDF出力）", case_labels)
+        selected_case_label = st.selectbox("案件選択（PDF出力）", case_labels, key="pdf_select_case")
         case_id = selected_id_from_label(selected_case_label)
 
         memo = build_case_memo(data, case_id)
