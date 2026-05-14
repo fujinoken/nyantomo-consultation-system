@@ -13,7 +13,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.3
+# にゃんとも相談管理システム Ver1.5
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -445,7 +445,7 @@ def render_search_update_delete(data):
     st.subheader("🔎 全データ検索・更新・削除")
     st.caption("相談者、案件、相談履歴、空き家、猫、家族、写真の各データを検索・編集・削除できます。")
 
-    table_name = st.selectbox("対象データを選択", list(TABLE_CONFIG.keys()))
+    table_name = st.selectbox("対象データを選択", list(TABLE_CONFIG.keys()), key="crud_table_select")
     cfg = TABLE_CONFIG[table_name]
     table_key = cfg["key"]
     id_col = cfg["id_col"]
@@ -457,7 +457,7 @@ def render_search_update_delete(data):
         st.info("このデータはまだ登録されていません。")
         return data
 
-    keyword = st.text_input("検索キーワード", placeholder="名前・地域・住所・猫の名前・メモなどで検索")
+    keyword = st.text_input("検索キーワード", placeholder="名前・地域・住所・猫の名前・メモなどで検索", key=f"crud_keyword_{table_key}")
     filtered_df = filter_df_keyword(df, keyword)
 
     st.write(f"検索結果：{len(filtered_df)}件")
@@ -481,7 +481,7 @@ def render_search_update_delete(data):
                     break
             label_options.append(f"{rid}｜{'｜'.join(title_parts)}")
 
-        selected_label = st.selectbox("編集するデータを選択", label_options)
+        selected_label = st.selectbox("編集するデータを選択", label_options, key=f"crud_edit_select_{table_key}")
         selected_id = selected_label.split("｜")[0]
         row_df = df[df[id_col] == selected_id]
 
@@ -551,8 +551,184 @@ def render_search_update_delete(data):
 
 
 # ---------------------------------------------------------
-# Ver1.4 追加：案件起点ダッシュボード
+# Ver1.5 追加：案件ホーム・タイムライン・停滞確認
 # ---------------------------------------------------------
+
+def parse_date_safe(value):
+    """YYYY-MM-DDや日時文字列をdateへ安全に変換する。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S"]:
+        try:
+            return datetime.strptime(text[:19], fmt).date()
+        except Exception:
+            pass
+    try:
+        return pd.to_datetime(text).date()
+    except Exception:
+        return None
+
+
+def latest_case_activity_date(data, case_id):
+    dates = []
+    for key, date_col in [
+        ("history", "記録日"),
+        ("properties", "登録日時"),
+        ("cats", "登録日時"),
+        ("family", "登録日時"),
+        ("photos", "登録日時"),
+    ]:
+        df = data[key]
+        if df.empty or "case_id" not in df.columns:
+            continue
+        rows = df[df["case_id"] == case_id]
+        if date_col not in rows.columns:
+            continue
+        for v in rows[date_col].tolist():
+            d = parse_date_safe(v)
+            if d:
+                dates.append(d)
+    return max(dates) if dates else None
+
+
+def case_silent_status(days):
+    if days is None:
+        return "記録なし"
+    if days >= 90:
+        return "90日以上未更新"
+    if days >= 60:
+        return "60日以上未更新"
+    if days >= 30:
+        return "30日以上未更新"
+    return "確認中"
+
+
+def build_case_timeline(data, case_id):
+    rows = []
+
+    history_df = data["history"][data["history"]["case_id"] == case_id]
+    for _, h in history_df.iterrows():
+        rows.append({
+            "日付": h.get("記録日", ""),
+            "種別": h.get("記録種別", "履歴"),
+            "内容": h.get("相談記録", ""),
+            "状態": f"{h.get('状態変更前','')} → {h.get('状態変更後','')}",
+            "次回": h.get("次回アクション", ""),
+        })
+
+    photo_df = data["photos"][data["photos"]["case_id"] == case_id]
+    for _, p in photo_df.iterrows():
+        rows.append({
+            "日付": str(p.get("登録日時", ""))[:10],
+            "種別": f"写真：{p.get('写真種別','')}",
+            "内容": p.get("説明", ""),
+            "状態": "",
+            "次回": "",
+        })
+
+    prop_df = data["properties"][data["properties"]["case_id"] == case_id]
+    for _, p in prop_df.iterrows():
+        rows.append({
+            "日付": str(p.get("登録日時", ""))[:10],
+            "種別": "空き家カード",
+            "内容": f"{p.get('物件名','')}｜{p.get('所在地','')}｜{p.get('物件状態','')}｜{p.get('空き家状態','')}",
+            "状態": p.get("管理頻度", ""),
+            "次回": "",
+        })
+
+    cat_df = data["cats"][data["cats"]["case_id"] == case_id]
+    for _, c in cat_df.iterrows():
+        rows.append({
+            "日付": str(c.get("登録日時", ""))[:10],
+            "種別": "猫情報",
+            "内容": f"{c.get('猫の名前','')}｜{c.get('現在の暮らし','')}｜{c.get('気になること','')}",
+            "状態": "",
+            "次回": "",
+        })
+
+    fam_df = data["family"][data["family"]["case_id"] == case_id]
+    for _, f in fam_df.iterrows():
+        rows.append({
+            "日付": str(f.get("登録日時", ""))[:10],
+            "種別": "家族関係",
+            "内容": f"{f.get('関係者名','')}｜{f.get('続柄','')}｜{f.get('温度感','')}｜{f.get('関係メモ','')}",
+            "状態": "",
+            "次回": "",
+        })
+
+    timeline = pd.DataFrame(rows, columns=["日付", "種別", "内容", "状態", "次回"])
+    if timeline.empty:
+        return timeline
+    timeline["_sort"] = pd.to_datetime(timeline["日付"], errors="coerce")
+    timeline = timeline.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+    return timeline.fillna("")
+
+
+def render_case_home(data):
+    st.subheader("🏡 案件ホーム")
+    st.caption("案件を起点に、止まっている案件・次に確認する案件・終了した案件を見渡します。")
+
+    if data["cases"].empty:
+        st.info("まだ案件がありません。先に相談者登録・案件登録をしてください。")
+        return data
+
+    rows = []
+    today = date.today()
+    for _, c in data["cases"].iterrows():
+        case_id = c.get("case_id", "")
+        client_id = c.get("client_id", "")
+        client_rows = data["clients"][data["clients"]["client_id"] == client_id]
+        client_name = client_rows.iloc[0].get("お名前", "") if not client_rows.empty else ""
+        latest = latest_case_activity_date(data, case_id)
+        days = (today - latest).days if latest else None
+        rows.append({
+            "案件名": c.get("案件名", ""),
+            "相談者": client_name,
+            "現在ステータス": c.get("現在ステータス", ""),
+            "案件種別": c.get("案件種別", ""),
+            "最終更新": latest.strftime("%Y-%m-%d") if latest else "",
+            "未更新日数": days if days is not None else "",
+            "静かな確認": case_silent_status(days),
+            "次回確認すること": c.get("次回確認すること", ""),
+            "case_id": case_id,
+        })
+
+    home_df = pd.DataFrame(rows)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("全案件", len(home_df))
+    c2.metric("進行中", len(home_df[home_df["現在ステータス"] != "終了"]))
+    c3.metric("終了", len(home_df[home_df["現在ステータス"] == "終了"]))
+    c4.metric("30日以上未更新", len(home_df[home_df["静かな確認"].isin(["30日以上未更新", "60日以上未更新", "90日以上未更新"])]))
+
+    show_active = st.checkbox("終了以外を中心に見る", value=True, key="home_active_only")
+    view_df = home_df.copy()
+    if show_active:
+        view_df = view_df[view_df["現在ステータス"] != "終了"]
+
+    status_filter = st.multiselect("ステータス絞り込み", STATUS_ORDER, default=[], key="home_status_filter")
+    if status_filter:
+        view_df = view_df[view_df["現在ステータス"].isin(status_filter)]
+
+    keyword = st.text_input("案件ホーム検索", placeholder="案件名・相談者・次回確認など", key="home_keyword")
+    view_df = filter_df_keyword(view_df, keyword)
+
+    st.markdown("### 案件一覧")
+    st.dataframe(view_df, use_container_width=True)
+
+    st.markdown("### 静かな確認が必要な案件")
+    alert_df = view_df[view_df["静かな確認"].isin(["30日以上未更新", "60日以上未更新", "90日以上未更新"])]
+    if alert_df.empty:
+        st.success("大きく止まっている案件はありません。")
+    else:
+        st.info("急がせるためではなく、確認のきっかけとして表示しています。")
+        st.dataframe(alert_df, use_container_width=True)
+
+    return data
+
 def render_case_dashboard(data):
     st.subheader("🗂 案件ダッシュボード")
     st.caption("case_idを中心に、相談者・履歴・空き家・猫・家族・写真を一画面で確認します。ゴールはステータスを『終了』まで進めることです。")
@@ -665,6 +841,28 @@ def render_case_dashboard(data):
             st.rerun()
 
     st.divider()
+    latest = latest_case_activity_date(data, case_id)
+    days = (date.today() - latest).days if latest else None
+    st.markdown("### 静かな確認")
+    if days is None:
+        st.info("この案件は、まだ履歴や関連データが少ない状態です。")
+    elif days >= 90:
+        st.warning(f"最終更新から{days}日です。終了・継続・保留理由の確認をおすすめします。")
+    elif days >= 60:
+        st.info(f"最終更新から{days}日です。必要なら一度、状況確認を入れてください。")
+    elif days >= 30:
+        st.info(f"最終更新から{days}日です。保留理由が変わっていないか確認できます。")
+    else:
+        st.success(f"最終更新から{days}日です。")
+
+    st.markdown("### タイムライン")
+    timeline = build_case_timeline(data, case_id)
+    if timeline.empty:
+        st.info("まだタイムラインに表示できる記録がありません。")
+    else:
+        st.dataframe(timeline, use_container_width=True)
+
+    st.divider()
     st.markdown("### この案件に紐づくデータ")
     rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "AI/PDF用メモ"])
 
@@ -723,10 +921,11 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.3")
-st.caption("相談を保留のまま管理する現場OS｜検索・更新・削除対応版")
+st.title("🐾 にゃんとも相談管理システム Ver1.5")
+st.caption("相談を保留のまま管理する現場OS｜案件起点・タイムライン・停滞確認対応版")
 
 tabs = st.tabs([
+    "🏡 案件ホーム",
     "🧑 相談者登録",
     "📝 案件登録",
     "🗂 案件ダッシュボード",
@@ -745,6 +944,10 @@ tabs = st.tabs([
 
 
 with tabs[0]:
+    data = render_case_home(data)
+
+
+with tabs[1]:
     st.subheader("相談者登録")
 
     with st.form("client_form"):
@@ -781,7 +984,7 @@ with tabs[0]:
     st.dataframe(data["clients"], use_container_width=True)
 
 
-with tabs[1]:
+with tabs[2]:
     st.subheader("案件登録")
 
     if data["clients"].empty:
@@ -876,10 +1079,10 @@ with tabs[1]:
     st.dataframe(data["cases"], use_container_width=True)
 
 
-with tabs[2]:
+with tabs[3]:
     data = render_case_dashboard(data)
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("相談履歴・状態変更")
 
     if data["cases"].empty:
@@ -935,7 +1138,7 @@ with tabs[3]:
         st.dataframe(data["history"][data["history"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("保留案件一覧")
     if data["cases"].empty:
         st.info("案件がありません。")
@@ -947,7 +1150,7 @@ with tabs[4]:
             st.dataframe(hold_df, use_container_width=True)
 
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("空き家カード")
 
     if data["cases"].empty:
@@ -997,7 +1200,7 @@ with tabs[5]:
         st.dataframe(data["properties"][data["properties"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("GoogleMap")
     st.caption("空き家カードの所在地からGoogleMapを開けます。APIキー不要の簡易版です。")
 
@@ -1014,7 +1217,7 @@ with tabs[6]:
                     st.link_button("GoogleMapで開く", map_url)
 
 
-with tabs[7]:
+with tabs[8]:
     st.subheader("猫情報カード")
 
     if data["cases"].empty:
@@ -1062,7 +1265,7 @@ with tabs[7]:
         st.dataframe(data["cats"][data["cats"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[8]:
+with tabs[9]:
     st.subheader("家族関係メモ")
 
     if data["cases"].empty:
@@ -1106,7 +1309,7 @@ with tabs[8]:
         st.dataframe(data["family"][data["family"]["case_id"] == case_id], use_container_width=True)
 
 
-with tabs[9]:
+with tabs[10]:
     st.subheader("写真管理")
     st.caption("現地写真、猫写真、書類写真などを案件ごとに保存します。")
 
@@ -1167,7 +1370,7 @@ with tabs[9]:
                     st.image(str(path), width=350)
 
 
-with tabs[10]:
+with tabs[11]:
     st.subheader("AI要約")
     st.caption("外部AIに送る前の安全な下書きと、コピー用プロンプトを作成します。")
 
@@ -1191,7 +1394,7 @@ with tabs[10]:
         st.warning("個人情報を外部AIへ入力する場合は、匿名化・伏せ字化してから使用してください。")
 
 
-with tabs[11]:
+with tabs[12]:
     st.subheader("PDF出力")
 
     if data["cases"].empty:
@@ -1213,11 +1416,11 @@ with tabs[11]:
         )
 
 
-with tabs[12]:
+with tabs[13]:
     data = render_search_update_delete(data)
 
 
-with tabs[13]:
+with tabs[14]:
     st.subheader("データ管理")
 
     if DATA_FILE.exists():
