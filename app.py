@@ -13,7 +13,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.2
+# にゃんとも相談管理システム Ver1.3
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -327,10 +327,232 @@ def make_pdf_bytes(text):
     return buffer.getvalue()
 
 
+
+# ---------------------------------------------------------
+# Ver1.3 追加：全データ共通の検索・更新・削除
+# ---------------------------------------------------------
+TABLE_CONFIG = {
+    "相談者データ": {
+        "key": "clients",
+        "id_col": "client_id",
+        "columns": CLIENT_COLUMNS,
+        "protected_cols": ["client_id", "登録日時"],
+    },
+    "案件データ": {
+        "key": "cases",
+        "id_col": "case_id",
+        "columns": CASE_COLUMNS,
+        "protected_cols": ["case_id", "client_id", "登録日時"],
+    },
+    "相談履歴データ": {
+        "key": "history",
+        "id_col": "history_id",
+        "columns": HISTORY_COLUMNS,
+        "protected_cols": ["history_id", "case_id", "client_id", "記録日時"],
+    },
+    "空き家カード": {
+        "key": "properties",
+        "id_col": "property_id",
+        "columns": PROPERTY_COLUMNS,
+        "protected_cols": ["property_id", "case_id", "client_id", "登録日時"],
+    },
+    "猫情報カード": {
+        "key": "cats",
+        "id_col": "cat_id",
+        "columns": CAT_COLUMNS,
+        "protected_cols": ["cat_id", "case_id", "client_id", "登録日時"],
+    },
+    "家族関係メモ": {
+        "key": "family",
+        "id_col": "family_id",
+        "columns": FAMILY_COLUMNS,
+        "protected_cols": ["family_id", "case_id", "client_id", "登録日時"],
+    },
+    "写真データ": {
+        "key": "photos",
+        "id_col": "photo_id",
+        "columns": PHOTO_COLUMNS,
+        "protected_cols": ["photo_id", "case_id", "client_id", "登録日時", "保存先"],
+    },
+}
+
+
+def filter_df_keyword(df, keyword):
+    if df.empty or not keyword:
+        return df
+    return df[df.astype(str).apply(lambda row: row.str.contains(keyword, case=False, na=False).any(), axis=1)]
+
+
+def sync_case_status_from_history(data, case_id):
+    history_df = data["history"][data["history"]["case_id"] == case_id]
+    if history_df.empty:
+        return data
+    latest = history_df.iloc[-1]
+    new_status = latest.get("状態変更後", "")
+    if new_status:
+        data["cases"].loc[data["cases"]["case_id"] == case_id, "現在ステータス"] = new_status
+    return data
+
+
+def delete_related_records(data, table_key, id_col, record_id):
+    """親データ削除時は関連データも一緒に削除する。"""
+    if table_key == "clients":
+        client_id = record_id
+        photo_rows = data["photos"][data["photos"]["client_id"] == client_id]
+        for _, p in photo_rows.iterrows():
+            path = Path(str(p.get("保存先", "")))
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+        for key in ["clients", "cases", "history", "properties", "cats", "family", "photos"]:
+            data[key] = data[key][data[key]["client_id"] != client_id] if "client_id" in data[key].columns else data[key]
+
+    elif table_key == "cases":
+        case_id = record_id
+        photo_rows = data["photos"][data["photos"]["case_id"] == case_id]
+        for _, p in photo_rows.iterrows():
+            path = Path(str(p.get("保存先", "")))
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+        for key in ["cases", "history", "properties", "cats", "family", "photos"]:
+            data[key] = data[key][data[key]["case_id"] != case_id] if "case_id" in data[key].columns else data[key]
+
+    elif table_key == "photos":
+        photo_rows = data["photos"][data["photos"][id_col] == record_id]
+        for _, p in photo_rows.iterrows():
+            path = Path(str(p.get("保存先", "")))
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+        data["photos"] = data["photos"][data["photos"][id_col] != record_id]
+
+    else:
+        data[table_key] = data[table_key][data[table_key][id_col] != record_id]
+
+    return data
+
+
+def render_search_update_delete(data):
+    st.subheader("🔎 全データ検索・更新・削除")
+    st.caption("相談者、案件、相談履歴、空き家、猫、家族、写真の各データを検索・編集・削除できます。")
+
+    table_name = st.selectbox("対象データを選択", list(TABLE_CONFIG.keys()))
+    cfg = TABLE_CONFIG[table_name]
+    table_key = cfg["key"]
+    id_col = cfg["id_col"]
+    columns = cfg["columns"]
+    protected_cols = cfg["protected_cols"]
+
+    df = data[table_key].copy()
+    if df.empty:
+        st.info("このデータはまだ登録されていません。")
+        return data
+
+    keyword = st.text_input("検索キーワード", placeholder="名前・地域・住所・猫の名前・メモなどで検索")
+    filtered_df = filter_df_keyword(df, keyword)
+
+    st.write(f"検索結果：{len(filtered_df)}件")
+    st.dataframe(filtered_df, use_container_width=True)
+
+    st.divider()
+    st.markdown("### 1件ずつ更新")
+
+    if filtered_df.empty:
+        st.info("検索結果がありません。")
+    else:
+        label_options = []
+        for _, row in filtered_df.iterrows():
+            rid = row[id_col]
+            title_parts = []
+            for col in columns:
+                value = str(row.get(col, ""))
+                if value and col != id_col:
+                    title_parts.append(value)
+                if len(title_parts) >= 2:
+                    break
+            label_options.append(f"{rid}｜{'｜'.join(title_parts)}")
+
+        selected_label = st.selectbox("編集するデータを選択", label_options)
+        selected_id = selected_label.split("｜")[0]
+        row_df = df[df[id_col] == selected_id]
+
+        if not row_df.empty:
+            row = row_df.iloc[0]
+            with st.form(f"edit_form_{table_key}"):
+                new_values = {}
+                for col in columns:
+                    value = str(row.get(col, ""))
+                    if col in protected_cols:
+                        st.text_input(col, value=value, disabled=True)
+                        new_values[col] = value
+                    else:
+                        if len(value) > 35 or "メモ" in col or "こと" in col or "記録" in col or "説明" in col:
+                            new_values[col] = st.text_area(col, value=value, height=100)
+                        else:
+                            new_values[col] = st.text_input(col, value=value)
+
+                submitted = st.form_submit_button("この内容で更新する")
+                if submitted:
+                    for col, value in new_values.items():
+                        data[table_key].loc[data[table_key][id_col] == selected_id, col] = value
+
+                    if table_key == "history":
+                        case_id = str(row.get("case_id", ""))
+                        if case_id:
+                            data = sync_case_status_from_history(data, case_id)
+
+                    save_all(data)
+                    st.success("更新しました。")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("### 削除")
+    st.warning("削除は元に戻せません。削除前に、データ管理からExcelをダウンロードしてバックアップしてください。")
+
+    if not filtered_df.empty:
+        delete_options = []
+        for _, row in filtered_df.iterrows():
+            rid = row[id_col]
+            title_parts = []
+            for col in columns:
+                value = str(row.get(col, ""))
+                if value and col != id_col:
+                    title_parts.append(value)
+                if len(title_parts) >= 2:
+                    break
+            delete_options.append(f"{rid}｜{'｜'.join(title_parts)}")
+
+        delete_label = st.selectbox("削除するデータを選択", delete_options, key=f"delete_{table_key}")
+        delete_id = delete_label.split("｜")[0]
+
+        if table_key == "clients":
+            st.error("相談者を削除すると、その相談者に紐づく案件・履歴・空き家・猫・家族・写真データも削除されます。")
+        elif table_key == "cases":
+            st.error("案件を削除すると、その案件に紐づく履歴・空き家・猫・家族・写真データも削除されます。")
+
+        confirm = st.checkbox("本当に削除します", key=f"confirm_delete_{table_key}")
+        if st.button("削除する", type="primary", disabled=not confirm):
+            data = delete_related_records(data, table_key, id_col, delete_id)
+            save_all(data)
+            st.success("削除しました。")
+            st.rerun()
+
+    return data
+
+
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.2")
-st.caption("PDF出力・AI要約・GoogleMap・写真管理を追加した拡張版")
+st.title("🐾 にゃんとも相談管理システム Ver1.3")
+st.caption("相談を保留のまま管理する現場OS｜検索・更新・削除対応版")
 
 tabs = st.tabs([
     "🧑 相談者登録",
@@ -344,6 +566,7 @@ tabs = st.tabs([
     "📷 写真管理",
     "🤖 AI要約",
     "🧾 PDF出力",
+    "🔎 検索・更新・削除",
     "📦 データ管理",
 ])
 
@@ -815,6 +1038,10 @@ with tabs[10]:
 
 
 with tabs[11]:
+    data = render_search_update_delete(data)
+
+
+with tabs[12]:
     st.subheader("データ管理")
 
     if DATA_FILE.exists():
@@ -825,6 +1052,11 @@ with tabs[11]:
                 file_name="nyantomo_consultation_data.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+    st.markdown("### 全データ一覧")
+    for label, cfg in TABLE_CONFIG.items():
+        with st.expander(label):
+            st.dataframe(data[cfg["key"]], use_container_width=True)
 
     st.markdown("### 注意")
     st.write(
