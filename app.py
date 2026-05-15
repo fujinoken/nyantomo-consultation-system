@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.2.1 リレーション安定版
+# にゃんとも相談管理システム Ver2.2.2 更新機能強化版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -2195,7 +2195,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.0ではSQLiteの各テーブルを検索できます。更新は案件を中心に最小限にしています。")
+    st.caption("Ver2.2.2では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -2205,93 +2205,234 @@ def page_search_update_delete():
         "猫": "cats",
         "家族": "family",
         "写真": "photos",
+        "AI履歴": "ai_summaries",
+        "LINE履歴": "line_messages",
     }
-    table_label = st.selectbox("対象データ", list(table_map.keys()))
+
+    id_cols = {
+        "clients": "client_id",
+        "cases": "case_id",
+        "history": "history_id",
+        "properties": "property_id",
+        "cats": "cat_id",
+        "family": "family_id",
+        "photos": "photo_id",
+        "ai_summaries": "summary_id",
+        "line_messages": "message_id",
+    }
+
+    table_label = st.selectbox("対象データ", list(table_map.keys()), key="sud_table_select")
     table = table_map[table_label]
+    id_col = id_cols[table]
+
     df = fetch_df(f"SELECT * FROM {table}")
-    keyword = st.text_input("検索キーワード", placeholder="名前・住所・猫の名前・メモなど")
+    keyword = st.text_input("検索キーワード", placeholder="名前・住所・猫の名前・メモなど", key=f"sud_keyword_{table}")
     if keyword and not df.empty:
         df = df[df.astype(str).apply(lambda row: row.str.contains(keyword, case=False, na=False).any(), axis=1)]
+
     st.write(f"検索結果：{len(df)}件")
     st.dataframe(df, use_container_width=True)
 
-    if table == "cases" and not df.empty:
-        st.markdown("### 案件の基本情報を更新")
-        labels = []
-        for _, r in df.iterrows():
-            labels.append(f"{r.get('case_title','')}｜{r.get('status','')}｜{r.get('case_id','')}")
-        selected = st.selectbox("更新する案件", labels, key="edit_case_select")
-        case_id = selected_id_from_label(selected)
-        c = get_case_full(case_id)
-        with st.form(f"edit_case_form_{case_id}"):
-            a, b = st.columns(2)
-            with a:
-                case_title = st.text_input("案件名", value=c.get("case_title", ""))
-                case_type = st.selectbox("案件種別", CASE_TYPES, index=option_index(CASE_TYPES, c.get("case_type", "")))
-                status = st.selectbox("現在ステータス", STATUS_ORDER, index=option_index(STATUS_ORDER, c.get("status", "")))
-                consult_date = st.date_input("相談日", value=parse_date_safe(c.get("consult_date")))
-                next_check_date = st.date_input("次回確認日", value=parse_date_safe(c.get("next_check_date")))
-            with b:
-                current_state = st.selectbox("今いちばん近い状態", CURRENT_STATE_OPTIONS, index=option_index(CURRENT_STATE_OPTIONS, c.get("current_state", "")))
-                house_state = st.selectbox("住まいの状態", HOUSE_STATE_OPTIONS, index=option_index(HOUSE_STATE_OPTIONS, c.get("house_state", "")))
-                cat_relation = st.selectbox("猫との関係", CAT_RELATION_OPTIONS, index=option_index(CAT_RELATION_OPTIONS, c.get("cat_relation", "")))
-                family_gap = st.selectbox("家族との温度差", FAMILY_GAP_OPTIONS, index=option_index(FAMILY_GAP_OPTIONS, c.get("family_gap", "")))
-                pressure = st.selectbox("急がされている感じ", PRESSURE_OPTIONS, index=option_index(PRESSURE_OPTIONS, c.get("pressure", "")))
-            worries = st.multiselect("気になること", WORRY_OPTIONS, default=[x for x in text_to_list(c.get("worries", "")) if x in WORRY_OPTIONS])
-            not_decide = st.text_area("今は決めたくないこと", value=c.get("not_decide", ""))
-            first_check = st.text_area("まず確認したいこと", value=c.get("first_check", ""))
-            free_memo = st.text_area("自由メモ", value=c.get("free_memo", ""))
-            internal_memo = st.text_area("内部メモ", value=c.get("internal_memo", ""))
-            next_check = st.text_area("次回確認すること", value=c.get("next_check", ""))
-            submitted = st.form_submit_button("この内容で更新する")
-            if submitted:
-                update_case_basic(case_id, {
-                    "case_title": case_title,
-                    "case_type": case_type,
-                    "status": status,
-                    "consult_date": date_or_blank(consult_date),
-                    "next_check_date": date_or_blank(next_check_date),
-                    "current_state": current_state,
-                    "house_state": house_state,
-                    "cat_relation": cat_relation,
-                    "family_gap": family_gap,
-                    "pressure": pressure,
-                    "worries": list_to_text(worries),
-                    "not_decide": not_decide,
-                    "first_check": first_check,
-                    "free_memo": free_memo,
-                    "internal_memo": internal_memo,
-                    "next_check": next_check,
-                })
-                st.success("案件を更新しました。")
-                st.rerun()
+    if df.empty:
+        st.info("更新・削除できるデータがありません。")
+        return
+
+    st.divider()
+    st.markdown("### 更新")
+    if not has_perm("write"):
+        st.warning("閲覧権限のみのため、更新はできません。")
+    else:
+        def make_label(row, cols):
+            parts = []
+            for col in cols:
+                v = str(row.get(col, ""))
+                if v:
+                    parts.append(v[:30])
+            parts.append(str(row.get(id_col, "")))
+            return "｜".join(parts)
+
+        label_cols_map = {
+            "clients": ["name", "area"],
+            "cases": ["case_title", "status"],
+            "history": ["record_date", "record_type"],
+            "properties": ["property_name", "address"],
+            "cats": ["cat_name", "current_life"],
+            "family": ["person_name", "relation"],
+            "photos": ["photo_type", "original_filename"],
+            "ai_summaries": ["created_at", "summary_type"],
+            "line_messages": ["created_at", "send_status"],
+        }
+
+        labels = [make_label(r, label_cols_map.get(table, [])) for _, r in df.iterrows()]
+        selected = st.selectbox("更新するデータ", labels, key=f"sud_update_select_{table}")
+        record_id = selected_id_from_label(selected)
+
+        row = fetch_one(f"SELECT * FROM {table} WHERE {id_col}=:id", {"id": record_id})
+        if not row:
+            st.error("対象データが見つかりません。")
+        else:
+            with st.form(f"sud_update_form_{table}_{record_id}"):
+                update_values = {}
+
+                if table == "clients":
+                    st.text_input("client_id", value=row.get("client_id", ""), disabled=True)
+                    st.text_input("登録日時", value=row.get("created_at", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["name"] = st.text_input("お名前", value=row.get("name", ""))
+                        update_values["age_group"] = st.selectbox("年代", AGE_OPTIONS, index=option_index(AGE_OPTIONS, row.get("age_group", "")))
+                        update_values["area"] = st.text_input("地域", value=row.get("area", ""))
+                    with c2:
+                        update_values["contact_method"] = st.selectbox("連絡方法", CONTACT_OPTIONS, index=option_index(CONTACT_OPTIONS, row.get("contact_method", "")))
+                        update_values["position"] = st.selectbox("相談者の立場", POSITION_OPTIONS, index=option_index(POSITION_OPTIONS, row.get("position", "")))
+                        update_values["note"] = st.text_area("備考", value=row.get("note", ""))
+
+                elif table == "cases":
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    st.text_input("client_id", value=row.get("client_id", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["case_title"] = st.text_input("案件名", value=row.get("case_title", ""))
+                        update_values["case_type"] = st.selectbox("案件種別", CASE_TYPES, index=option_index(CASE_TYPES, row.get("case_type", "")))
+                        update_values["status"] = st.selectbox("現在ステータス", STATUS_ORDER, index=option_index(STATUS_ORDER, row.get("status", "")))
+                        update_values["consult_date"] = date_or_blank(st.date_input("相談日", value=parse_date_safe(row.get("consult_date")), key=f"sud_consult_{record_id}"))
+                        update_values["next_check_date"] = date_or_blank(st.date_input("次回確認日", value=parse_date_safe(row.get("next_check_date")), key=f"sud_next_{record_id}"))
+                    with c2:
+                        update_values["current_state"] = st.selectbox("今いちばん近い状態", CURRENT_STATE_OPTIONS, index=option_index(CURRENT_STATE_OPTIONS, row.get("current_state", "")))
+                        update_values["house_state"] = st.selectbox("住まいの状態", HOUSE_STATE_OPTIONS, index=option_index(HOUSE_STATE_OPTIONS, row.get("house_state", "")))
+                        update_values["cat_relation"] = st.selectbox("猫との関係", CAT_RELATION_OPTIONS, index=option_index(CAT_RELATION_OPTIONS, row.get("cat_relation", "")))
+                        update_values["family_gap"] = st.selectbox("家族との温度差", FAMILY_GAP_OPTIONS, index=option_index(FAMILY_GAP_OPTIONS, row.get("family_gap", "")))
+                        update_values["pressure"] = st.selectbox("急がされている感じ", PRESSURE_OPTIONS, index=option_index(PRESSURE_OPTIONS, row.get("pressure", "")))
+                    update_values["worries"] = list_to_text(st.multiselect("気になること", WORRY_OPTIONS, default=[x for x in text_to_list(row.get("worries", "")) if x in WORRY_OPTIONS]))
+                    update_values["not_decide"] = st.text_area("今は決めたくないこと", value=row.get("not_decide", ""))
+                    update_values["first_check"] = st.text_area("まず確認したいこと", value=row.get("first_check", ""))
+                    update_values["free_memo"] = st.text_area("自由メモ", value=row.get("free_memo", ""))
+                    update_values["internal_memo"] = st.text_area("内部メモ", value=row.get("internal_memo", ""))
+                    update_values["next_check"] = st.text_area("次回確認すること", value=row.get("next_check", ""))
+                    update_values["closed_date"] = st.text_input("終了日", value=row.get("closed_date", ""))
+                    update_values["close_reason"] = st.text_input("終了理由", value=row.get("close_reason", ""))
+                    update_values["final_memo"] = st.text_area("最終メモ", value=row.get("final_memo", ""))
+                    update_values["reopen_possibility"] = st.selectbox("再相談可能性", REOPEN_OPTIONS, index=option_index(REOPEN_OPTIONS, row.get("reopen_possibility", "")))
+
+                elif table == "history":
+                    st.text_input("history_id", value=row.get("history_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    st.text_input("client_id", value=row.get("client_id", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["record_date"] = date_or_blank(st.date_input("記録日", value=parse_date_safe(row.get("record_date")), key=f"sud_hist_date_{record_id}"))
+                        update_values["record_type"] = st.selectbox("記録種別", ["相談", "電話", "LINE", "メール", "面談", "現地確認", "状態変更", "終了確認", "その他"], index=option_index(["相談", "電話", "LINE", "メール", "面談", "現地確認", "状態変更", "終了確認", "その他"], row.get("record_type", "")))
+                    with c2:
+                        update_values["before_status"] = st.selectbox("状態変更前", [""] + STATUS_ORDER, index=option_index([""] + STATUS_ORDER, row.get("before_status", "")))
+                        update_values["after_status"] = st.selectbox("状態変更後", [""] + STATUS_ORDER, index=option_index([""] + STATUS_ORDER, row.get("after_status", "")))
+                    update_values["record"] = st.text_area("相談記録", value=row.get("record", ""))
+                    update_values["next_action"] = st.text_area("次回アクション", value=row.get("next_action", ""))
+                    update_values["internal_memo"] = st.text_area("内部メモ", value=row.get("internal_memo", ""))
+
+                elif table == "properties":
+                    st.text_input("property_id", value=row.get("property_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["property_name"] = st.text_input("物件名", value=row.get("property_name", ""))
+                        update_values["address"] = st.text_input("所在地", value=row.get("address", ""))
+                        update_values["property_status"] = st.selectbox("物件状態", PROPERTY_STATUS_OPTIONS, index=option_index(PROPERTY_STATUS_OPTIONS, row.get("property_status", "")))
+                        update_values["vacant_status"] = st.selectbox("空き家状態", VACANT_STATUS_OPTIONS, index=option_index(VACANT_STATUS_OPTIONS, row.get("vacant_status", "")))
+                    with c2:
+                        update_values["key_hold"] = st.selectbox("鍵預かり", KEY_HOLD_OPTIONS, index=option_index(KEY_HOLD_OPTIONS, row.get("key_hold", "")))
+                        update_values["neighborhood_anxiety"] = st.selectbox("近隣不安", NEIGHBORHOOD_OPTIONS, index=option_index(NEIGHBORHOOD_OPTIONS, row.get("neighborhood_anxiety", "")))
+                        update_values["management_frequency"] = st.selectbox("管理頻度", FREQUENCY_OPTIONS, index=option_index(FREQUENCY_OPTIONS, row.get("management_frequency", "")))
+                    update_values["memo"] = st.text_area("メモ", value=row.get("memo", ""))
+
+                elif table == "cats":
+                    st.text_input("cat_id", value=row.get("cat_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["cat_name"] = st.text_input("猫の名前", value=row.get("cat_name", ""))
+                        update_values["age"] = st.text_input("年齢", value=row.get("age", ""))
+                        update_values["count"] = st.text_input("頭数", value=row.get("count", ""))
+                        update_values["current_life"] = st.selectbox("現在の暮らし", CAT_LIFE_OPTIONS, index=option_index(CAT_LIFE_OPTIONS, row.get("current_life", "")))
+                    with c2:
+                        update_values["concerns"] = st.text_area("気になること", value=row.get("concerns", ""))
+                        update_values["place_candidate"] = st.text_area("預け先候補", value=row.get("place_candidate", ""))
+                        update_values["memo"] = st.text_area("メモ", value=row.get("memo", ""))
+
+                elif table == "family":
+                    st.text_input("family_id", value=row.get("family_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        update_values["person_name"] = st.text_input("関係者名", value=row.get("person_name", ""))
+                        update_values["relation"] = st.text_input("続柄", value=row.get("relation", ""))
+                        update_values["contact_ok"] = st.selectbox("連絡可否", CONTACT_OK_OPTIONS, index=option_index(CONTACT_OK_OPTIONS, row.get("contact_ok", "")))
+                    with c2:
+                        update_values["temperature"] = st.selectbox("温度感", TEMP_OPTIONS, index=option_index(TEMP_OPTIONS, row.get("temperature", "")))
+                        update_values["relation_memo"] = st.text_area("関係メモ", value=row.get("relation_memo", ""))
+
+                elif table == "photos":
+                    st.text_input("photo_id", value=row.get("photo_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["photo_type"] = st.selectbox("写真種別", PHOTO_TYPE_OPTIONS, index=option_index(PHOTO_TYPE_OPTIONS, row.get("photo_type", "")))
+                    update_values["original_filename"] = st.text_input("元ファイル名", value=row.get("original_filename", ""))
+                    st.text_input("保存先", value=row.get("saved_path", ""), disabled=True)
+                    update_values["description"] = st.text_area("説明", value=row.get("description", ""))
+
+                elif table == "ai_summaries":
+                    st.text_input("summary_id", value=row.get("summary_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["summary_type"] = st.text_input("要約種別", value=row.get("summary_type", ""))
+                    update_values["ai_result"] = st.text_area("AI結果", value=row.get("ai_result", ""), height=260)
+                    update_values["note"] = st.text_area("補足メモ", value=row.get("note", ""))
+
+                elif table == "line_messages":
+                    st.text_input("message_id", value=row.get("message_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["to_target"] = st.text_input("送信先ID", value=row.get("to_target", ""))
+                    update_values["message_text"] = st.text_area("送信文", value=row.get("message_text", ""), height=220)
+                    update_values["send_status"] = st.selectbox("送信状態", ["下書き保存", "送信予定", "送信済", "送信失敗", "中止"], index=option_index(["下書き保存", "送信予定", "送信済", "送信失敗", "中止"], row.get("send_status", "")))
+                    update_values["response_memo"] = st.text_area("反応・メモ", value=row.get("response_memo", ""))
+
+                submitted = st.form_submit_button("この内容で更新する")
+                if submitted:
+                    update_values = {k: ("" if v is None else v) for k, v in update_values.items()}
+                    if table == "cases":
+                        update_values["updated_at"] = now_text()
+                    set_sql = ", ".join([f"{k}=:{k}" for k in update_values.keys()])
+                    params = dict(update_values)
+                    params["id"] = record_id
+                    execute(f"UPDATE {table} SET {set_sql} WHERE {id_col}=:id", params)
+
+                    # 関連データ更新時は親案件の updated_at も更新
+                    if table in ["history", "properties", "cats", "family", "photos", "ai_summaries", "line_messages"]:
+                        related_case_id = row.get("case_id", "")
+                        if related_case_id:
+                            execute("UPDATE cases SET updated_at=:updated_at WHERE case_id=:case_id", {"updated_at": now_text(), "case_id": related_case_id})
+
+                    add_audit_log("update_record", table, record_id, "検索・更新・削除画面から更新")
+                    st.success("更新しました。")
+                    st.rerun()
 
     st.divider()
     st.markdown("### 削除")
     st.warning("削除は元に戻せません。削除前に必ずバックアップしてください。")
-    if not df.empty:
-        id_cols = {
-            "clients": "client_id",
-            "cases": "case_id",
-            "history": "history_id",
-            "properties": "property_id",
-            "cats": "cat_id",
-            "family": "family_id",
-            "photos": "photo_id",
-        }
-        id_col = id_cols[table]
-        delete_id = st.selectbox("削除するID", df[id_col].astype(str).tolist(), key=f"delete_{table}")
-        confirm = st.checkbox("本当に削除します", key=f"confirm_delete_{table}")
-        if st.button("削除する", type="primary", disabled=not confirm):
-            removed_files = 0
-            if table == "cases":
-                removed_files = delete_photo_files_for_case(delete_id)
-            elif table == "photos":
-                removed_files = delete_photo_file_by_id(delete_id)
-            execute(f"DELETE FROM {table} WHERE {id_col}=:id", {"id": delete_id})
-            add_audit_log("delete_record", table, delete_id, f"removed_photo_files={removed_files}")
-            st.success(f"削除しました。写真ファイル削除：{removed_files}件")
-            st.rerun()
+
+    if not has_perm("delete"):
+        st.info("削除は管理者権限のみ可能です。")
+        return
+
+    delete_id = st.selectbox("削除するID", df[id_col].astype(str).tolist(), key=f"delete_{table}")
+    confirm = st.checkbox("本当に削除します", key=f"confirm_delete_{table}")
+    if st.button("削除する", type="primary", disabled=not confirm):
+        removed_files = 0
+        if table == "cases":
+            removed_files = delete_photo_files_for_case(delete_id)
+        elif table == "photos":
+            removed_files = delete_photo_file_by_id(delete_id)
+        execute(f"DELETE FROM {table} WHERE {id_col}=:id", {"id": delete_id})
+        add_audit_log("delete_record", table, delete_id, f"removed_photo_files={removed_files}")
+        st.success(f"削除しました。写真ファイル削除：{removed_files}件")
+        st.rerun()
 
 
 def page_data_management():
@@ -2542,7 +2683,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.2.1（リレーション安定版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.2.2（更新機能強化版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
