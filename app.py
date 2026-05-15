@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.5.3 伴走支援版
+# にゃんとも相談管理システム Ver2.5.4 伴走支援版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -31,7 +31,7 @@ from reportlab.pdfbase import pdfmetrics
 # =========================================================
 
 st.set_page_config(
-    page_title="にゃんとも相談管理システム Ver2.0",
+    page_title="にゃんとも相談管理システム Ver2.5.4",
     page_icon="🐾",
     layout="wide"
 )
@@ -514,7 +514,13 @@ def init_db():
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5.3')")
+
+        # Ver2.5.4: 伴走支援系テーブルにも更新日時を追加。
+        # チェック済み状態が「いつ更新されたか」を案件単位で追えるようにする。
+        for table in ["hearing_checklist", "state_changes", "follow_suggestions"]:
+            add_column_if_missing(conn, table, "updated_at")
+
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5.4')")
         conn.executescript('''
         CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
         CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
@@ -526,6 +532,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_photos_case_id ON photos(case_id);
         CREATE INDEX IF NOT EXISTS idx_ai_summaries_case_id ON ai_summaries(case_id);
         CREATE INDEX IF NOT EXISTS idx_line_messages_case_id ON line_messages(case_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_case_id ON hearing_checklist(case_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_client_id ON hearing_checklist(client_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_checked ON hearing_checklist(checked);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hearing_checklist_case_category_item ON hearing_checklist(case_id, category, item);
+        CREATE INDEX IF NOT EXISTS idx_state_changes_case_id ON state_changes(case_id);
+        CREATE INDEX IF NOT EXISTS idx_follow_suggestions_case_id ON follow_suggestions(case_id);
         ''')
         conn.commit()
 
@@ -1374,7 +1386,7 @@ def export_all_to_excel_bytes():
 
 
 # -----------------------------
-# Ver2.5.3 安定稼働：インデックス・整合性チェック
+# Ver2.5.4 安定稼働：インデックス・整合性チェック
 # -----------------------------
 def ensure_indexes():
     """検索・関連データ取得を安定化するためのインデックスを作成する。"""
@@ -1400,6 +1412,9 @@ def ensure_indexes():
         CREATE INDEX IF NOT EXISTS idx_line_messages_case_id ON line_messages(case_id);
         CREATE INDEX IF NOT EXISTS idx_line_messages_client_id ON line_messages(client_id);
         CREATE INDEX IF NOT EXISTS idx_hearing_checklist_case_id ON hearing_checklist(case_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_client_id ON hearing_checklist(client_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_checked ON hearing_checklist(checked);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hearing_checklist_case_category_item ON hearing_checklist(case_id, category, item);
         CREATE INDEX IF NOT EXISTS idx_state_changes_case_id ON state_changes(case_id);
         CREATE INDEX IF NOT EXISTS idx_follow_suggestions_case_id ON follow_suggestions(case_id);
         """)
@@ -1963,37 +1978,94 @@ def generate_follow_suggestions(case_id):
 
 
 def save_generated_hearing_items(case_id, items):
+    """
+    自動生成した次回ヒアリング項目を、必ず「案件 case_id」に紐づけて保存する。
+    同じ案件内で同一カテゴリ・同一項目は重複登録しない。
+    """
     c = get_case_full(case_id)
     if not c:
         return 0
     count = 0
     for it in items:
+        category = str(it.get("category", "")).strip()
+        item = str(it.get("item", "")).strip()
+        if not item:
+            continue
         exists = fetch_one("""
             SELECT checklist_id FROM hearing_checklist
-            WHERE case_id=:case_id AND item=:item
+            WHERE case_id=:case_id AND category=:category AND item=:item
             LIMIT 1
-        """, {"case_id": case_id, "item": it["item"]})
+        """, {"case_id": case_id, "category": category, "item": item})
         if exists:
             continue
         execute("""
             INSERT INTO hearing_checklist(checklist_id, case_id, client_id, created_at, created_by,
-                                          item, category, checked, checked_at, note, source)
+                                          item, category, checked, checked_at, note, source, updated_at)
             VALUES(:checklist_id, :case_id, :client_id, :created_at, :created_by,
-                   :item, :category, '0', '', '', 'auto')
+                   :item, :category, '0', '', '', 'auto', :updated_at)
         """, {
             "checklist_id": make_id("hear"),
             "case_id": case_id,
             "client_id": c["client_id"],
             "created_at": now_text(),
             "created_by": (current_user() or {}).get("username", ""),
-            "item": it["item"],
-            "category": it["category"],
+            "item": item,
+            "category": category,
+            "updated_at": now_text(),
         })
         count += 1
     if count:
+        touch_case(case_id)
         add_audit_log("save_hearing_items", "case", case_id, f"count={count}")
     return count
 
+
+def get_hearing_checklist_df(case_id):
+    return fetch_df("""
+        SELECT checklist_id, case_id, client_id, created_at, updated_at,
+               category, item, checked, checked_at, note, source
+        FROM hearing_checklist
+        WHERE case_id=:case_id
+        ORDER BY
+            CASE checked WHEN '1' THEN 1 ELSE 0 END ASC,
+            category ASC,
+            created_at ASC
+    """, {"case_id": case_id})
+
+
+def update_hearing_checklist_item(checklist_id, checked, note):
+    """checklist_idを主キーに更新。ただし親案件のupdated_atも必ず更新する。"""
+    row = fetch_one("SELECT * FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
+    if not row:
+        return False
+    checked = "1" if str(checked) == "1" or checked is True else "0"
+    execute("""
+        UPDATE hearing_checklist
+        SET checked=:checked,
+            checked_at=:checked_at,
+            note=:note,
+            updated_at=:updated_at
+        WHERE checklist_id=:id
+    """, {
+        "checked": checked,
+        "checked_at": now_text() if checked == "1" else "",
+        "note": note or "",
+        "updated_at": now_text(),
+        "id": checklist_id,
+    })
+    touch_case(row.get("case_id", ""))
+    add_audit_log("update_hearing_checklist", "case", row.get("case_id", ""), checklist_id)
+    return True
+
+
+def delete_hearing_checklist_item(checklist_id):
+    row = fetch_one("SELECT * FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
+    if not row:
+        return False
+    execute("DELETE FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
+    touch_case(row.get("case_id", ""))
+    add_audit_log("delete_hearing_checklist", "case", row.get("case_id", ""), checklist_id)
+    return True
 
 def save_follow_suggestions(case_id, suggestions):
     c = get_case_full(case_id)
@@ -2053,58 +2125,80 @@ def render_companion_support(case_id, key_prefix='main'):
 
     with support_tabs[0]:
         st.markdown("### 次回ヒアリング項目")
+        st.info(f"このチェックリストは、相談者ではなく **案件 case_id：{case_id}** に紐づいて保存されます。")
+
+        st.markdown("#### 自動生成された候補")
         if hearing_items:
             df = pd.DataFrame(hearing_items)
             st.dataframe(df, use_container_width=True)
-            for idx, it in enumerate(hearing_items):
-                st.checkbox(
-                    f"{it['category']}｜{it['item']}",
-                    key=f"{key_prefix}_preview_hear_{case_id}_{idx}",
-                    disabled=True
-                )
-            if st.button("このヒアリング項目を保存する", key=f"{key_prefix}_save_hearing_{case_id}", disabled=not has_perm("write")):
+            if st.button("未保存のヒアリング項目をこの案件に保存する", key=f"{key_prefix}_save_hearing_{case_id}", disabled=not has_perm("write")):
                 cnt = save_generated_hearing_items(case_id, hearing_items)
-                st.success(f"{cnt}件保存しました。")
+                if cnt == 0:
+                    st.info("新規保存する項目はありません。すでにこの案件に保存済みです。")
+                else:
+                    st.success(f"{cnt}件を案件に保存しました。")
                 st.rerun()
         else:
             st.success("追加で提案するヒアリング項目は少ないです。")
 
-        st.markdown("### 保存済みチェックリスト")
-        saved = fetch_df("""
-            SELECT checklist_id, created_at, category, item, checked, checked_at, note
-            FROM hearing_checklist
-            WHERE case_id=:case_id
-            ORDER BY created_at DESC
-        """, {"case_id": case_id})
-        st.dataframe(saved, use_container_width=True)
+        st.divider()
+        st.markdown("#### 保存済みチェックリスト（案件に紐づく実データ）")
+        saved = get_hearing_checklist_df(case_id)
+        if saved.empty:
+            st.warning("この案件には、まだ保存済みチェックリストがありません。上の候補を保存してください。")
+        else:
+            view = saved.copy()
+            view["確認状態"] = view["checked"].map({"1": "確認済", "0": "未確認"}).fillna("未確認")
+            st.dataframe(view[["確認状態", "category", "item", "checked_at", "note", "checklist_id"]], use_container_width=True)
 
-        if not saved.empty and has_perm("write"):
-            selected = st.selectbox(
-                "チェック更新する項目",
-                [f"{r['category']}｜{r['item']}｜{r['checklist_id']}" for _, r in saved.iterrows()],
-                key=f"{key_prefix}_checklist_update_select_{case_id}"
-            )
-            checklist_id = selected_id_from_label(selected)
-            row = fetch_one("SELECT * FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
-            with st.form(f"{key_prefix}_checklist_update_form_{checklist_id}"):
-                checked = st.selectbox("確認状態", ["0", "1"], index=1 if row.get("checked") == "1" else 0, format_func=lambda x: "確認済" if x == "1" else "未確認")
-                note = st.text_area("確認メモ", value=row.get("note", ""))
-                submitted = st.form_submit_button("チェックリストを更新")
-                if submitted:
-                    execute("""
-                        UPDATE hearing_checklist
-                        SET checked=:checked, checked_at=:checked_at, note=:note
-                        WHERE checklist_id=:id
-                    """, {
-                        "checked": checked,
-                        "checked_at": now_text() if checked == "1" else "",
-                        "note": note,
-                        "id": checklist_id,
-                    })
-                    touch_case(case_id)
-                    add_audit_log("update_hearing_checklist", "case", case_id, checklist_id)
-                    st.success("更新しました。")
-                    st.rerun()
+            if has_perm("write"):
+                st.markdown("##### チェック更新")
+                st.caption("各項目は checklist_id で更新し、親案件の updated_at も同時に更新します。")
+                changed_payload = []
+                for _, r in saved.iterrows():
+                    cid = r["checklist_id"]
+                    with st.container(border=True):
+                        checked_bool = str(r.get("checked", "0")) == "1"
+                        new_checked = st.checkbox(
+                            f"{r.get('category','')}｜{r.get('item','')}",
+                            value=checked_bool,
+                            key=f"{key_prefix}_hear_checked_{cid}"
+                        )
+                        new_note = st.text_area(
+                            "確認メモ",
+                            value=r.get("note", "") or "",
+                            key=f"{key_prefix}_hear_note_{cid}",
+                            height=80
+                        )
+                        changed_payload.append({"checklist_id": cid, "checked": new_checked, "note": new_note})
+
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    if st.button("チェック状態をまとめて保存", key=f"{key_prefix}_bulk_save_hearing_{case_id}"):
+                        updated = 0
+                        for item in changed_payload:
+                            ok = update_hearing_checklist_item(
+                                item["checklist_id"],
+                                "1" if item["checked"] else "0",
+                                item["note"]
+                            )
+                            if ok:
+                                updated += 1
+                        st.success(f"{updated}件を更新しました。")
+                        st.rerun()
+
+                with c2:
+                    del_target = st.selectbox(
+                        "削除する項目（必要時のみ）",
+                        [f"{r['category']}｜{str(r['item'])[:35]}｜{r['checklist_id']}" for _, r in saved.iterrows()],
+                        key=f"{key_prefix}_delete_hearing_select_{case_id}"
+                    )
+                    del_id = selected_id_from_label(del_target)
+                    confirm_del = st.checkbox("選択したヒアリング項目を削除する", key=f"{key_prefix}_delete_hearing_confirm_{case_id}")
+                    if st.button("選択項目を削除", key=f"{key_prefix}_delete_hearing_btn_{case_id}", disabled=not confirm_del):
+                        delete_hearing_checklist_item(del_id)
+                        st.success("削除しました。")
+                        st.rerun()
 
     with support_tabs[1]:
         st.markdown("### ヒアリング漏れ警告")
@@ -2954,7 +3048,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.5.3では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.5.4では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -3161,12 +3255,14 @@ def page_search_update_delete():
                 elif table == "hearing_checklist":
                     st.text_input("checklist_id", value=row.get("checklist_id", ""), disabled=True)
                     st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    st.text_input("client_id", value=row.get("client_id", ""), disabled=True)
                     update_values["category"] = st.text_input("カテゴリ", value=row.get("category", ""))
                     update_values["item"] = st.text_area("ヒアリング項目", value=row.get("item", ""), height=120)
                     update_values["checked"] = st.selectbox("確認状態", ["0", "1"], index=1 if row.get("checked") == "1" else 0, format_func=lambda x: "確認済" if x == "1" else "未確認")
                     update_values["checked_at"] = st.text_input("確認日時", value=row.get("checked_at", ""))
                     update_values["note"] = st.text_area("メモ", value=row.get("note", ""))
                     update_values["source"] = st.text_input("作成元", value=row.get("source", ""))
+                    update_values["updated_at"] = now_text()
 
                 elif table == "state_changes":
                     st.text_input("change_id", value=row.get("change_id", ""), disabled=True)
@@ -3190,6 +3286,10 @@ def page_search_update_delete():
                 submitted = st.form_submit_button("この内容で更新する")
                 if submitted:
                     update_values = {k: ("" if v is None else v) for k, v in update_values.items()}
+                    if table == "hearing_checklist" and update_values.get("checked") == "1" and not update_values.get("checked_at"):
+                        update_values["checked_at"] = now_text()
+                    if table == "hearing_checklist" and update_values.get("checked") == "0":
+                        update_values["checked_at"] = ""
                     if table == "cases":
                         update_values["updated_at"] = now_text()
                     set_sql = ", ".join([f"{k}=:{k}" for k in update_values.keys()])
@@ -3198,7 +3298,7 @@ def page_search_update_delete():
                     execute(f"UPDATE {table} SET {set_sql} WHERE {id_col}=:id", params)
 
                     # 関連データ更新時は親案件の updated_at も更新
-                    if table in ["history", "properties", "cats", "family", "photos", "ai_summaries", "line_messages"]:
+                    if table in ["history", "properties", "cats", "family", "photos", "ai_summaries", "line_messages", "hearing_checklist", "state_changes", "follow_suggestions"]:
                         related_case_id = row.get("case_id", "")
                         if related_case_id:
                             execute("UPDATE cases SET updated_at=:updated_at WHERE case_id=:case_id", {"updated_at": now_text(), "case_id": related_case_id})
@@ -3537,7 +3637,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.5.3.1（安定稼働版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.5.4（安定稼働版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
