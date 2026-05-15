@@ -1104,8 +1104,8 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6.2（重複判定精度修正版）")
-st.caption("相談を保留のまま管理する現場OS｜client_id基準で正確に重複登録を防止")
+st.title("🐾 にゃんとも相談管理システム Ver1.6.3（重複判定安定版）")
+st.caption("相談を保留のまま管理する現場OS｜相談者選択をフォーム外に出し、重複判定を安定化")
 
 tabs = st.tabs([
     "🏡 案件ホーム",
@@ -1169,68 +1169,82 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("案件登録")
+    st.caption("相談者を選んだ時点で重複確認を行います。未終了案件がある場合は、新規登録ではなく既存案件に履歴を追加します。")
 
     if data["clients"].empty:
         st.info("先に相談者を登録してください。")
     else:
         client_labels = [get_client_label(row) for _, row in data["clients"].iterrows()]
 
+        # 重要：相談者選択は form の外に置く。
+        # Streamlit の form 内の selectbox は送信まで値が確定しないため、
+        # 以前選択していた相談者の重複判定が残って見えることがある。
+        selected_client_label = st.selectbox(
+            "相談者を選択",
+            client_labels,
+            key="case_register_client_select_outside_form"
+        )
+        client_id = selected_id_from_label(selected_client_label)
+
+        duplicate_cases_preview = find_duplicate_active_cases_by_client_id(data, client_id)
+        same_name_warning_preview = find_same_name_active_cases_for_warning(data, client_id)
+        duplicate_blocked = not duplicate_cases_preview.empty
+
+        if duplicate_blocked:
+            st.warning("この相談者には、すでに終了していない案件が登録されています。二重登録防止のため、新規案件登録はできません。既存案件の『案件ダッシュボード』または『相談履歴』から追記してください。")
+            st.dataframe(
+                duplicate_cases_preview[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
+                use_container_width=True
+            )
+        elif not same_name_warning_preview.empty:
+            st.info("同じお名前の別相談者に未終了案件があります。別人・別地域であれば、このまま登録できます。念のため既存案件を確認してください。")
+            st.dataframe(
+                same_name_warning_preview[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
+                use_container_width=True
+            )
+
         with st.form("case_form"):
-            selected_client_label = st.selectbox("相談者を選択", client_labels)
-            client_id = selected_id_from_label(selected_client_label)
-
-            duplicate_cases_preview = find_duplicate_active_cases_by_client_id(data, client_id)
-            same_name_warning_preview = find_same_name_active_cases_for_warning(data, client_id)
-            if not duplicate_cases_preview.empty:
-                st.warning("この相談者には、すでに終了していない案件が登録されています。二重登録防止のため、新規案件登録はできません。既存案件の『案件ダッシュボード』または『相談履歴』から追記してください。")
-                st.dataframe(
-                    duplicate_cases_preview[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
-                    use_container_width=True
-                )
-            elif not same_name_warning_preview.empty:
-                st.info("同じお名前の別相談者に未終了案件があります。別人・別地域であれば、このまま登録できます。念のため既存案件を確認してください。")
-                st.dataframe(
-                    same_name_warning_preview[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
-                    use_container_width=True
-                )
-
             col1, col2 = st.columns(2)
             with col1:
-                consult_date = st.date_input("相談日", value=date.today())
-                case_title = st.text_input("案件名", value="住まいと猫の相談")
-                case_type = st.selectbox("案件種別", ["初回相談", "空き家管理", "猫と住まい", "相続前整理", "高齢期の住まい", "その他"])
-                status = st.selectbox("現在ステータス", STATUS_ORDER, index=1)
+                consult_date = st.date_input("相談日", value=date.today(), key="case_register_consult_date")
+                case_title = st.text_input("案件名", value="住まいと猫の相談", key="case_register_case_title")
+                case_type = st.selectbox("案件種別", ["初回相談", "空き家管理", "猫と住まい", "相続前整理", "高齢期の住まい", "その他"], key="case_register_case_type")
+                status = st.selectbox("現在ステータス", STATUS_ORDER, index=1, key="case_register_status")
                 current_state = st.selectbox(
                     "今いちばん近い状態",
                     ["未選択", "まだ何も決まっていない", "少し考え始めている", "家族と話し始めた", "急かされている感じがある", "誰にも相談していない", "すでに困りごとが出ている"],
+                    key="case_register_current_state"
                 )
             with col2:
                 house_state = st.selectbox(
                     "住まいの状態",
                     ["未選択", "現在住んでいる", "空き家になっている", "近いうちに空き家になりそう", "相続後そのまま", "売却・賃貸を迷っている", "荷物整理が進んでいない"],
+                    key="case_register_house_state"
                 )
                 cat_relation = st.selectbox(
                     "猫との関係",
                     ["未選択", "猫と暮らしている", "家族の猫がいる", "猫を残して入院・施設入所が心配", "これから猫と暮らしたい", "保護猫に関心がある", "猫はいない"],
+                    key="case_register_cat_relation"
                 )
-                family_gap = st.selectbox("家族との温度差", ["未選択", "特にない", "少しある", "かなりある", "まだ話せていない"])
-                pressure = st.selectbox("急がされている感じ", ["未選択", "ない", "少しある", "強くある", "自分でも焦っている"])
+                family_gap = st.selectbox("家族との温度差", ["未選択", "特にない", "少しある", "かなりある", "まだ話せていない"], key="case_register_family_gap")
+                pressure = st.selectbox("急がされている感じ", ["未選択", "ない", "少しある", "強くある", "自分でも焦っている"], key="case_register_pressure")
 
             worries = st.multiselect(
                 "気になること",
                 ["空き家管理", "相続", "売却", "賃貸", "猫の住まい", "高齢期の暮らし", "家族との意見の違い", "お金", "近所への不安", "何から考えればよいか分からない"],
+                key="case_register_worries"
             )
 
-            not_decide = st.text_area("今は決めたくないこと")
-            first_check = st.text_area("まず確認したいこと")
-            free_memo = st.text_area("自由メモ")
-            internal_memo = st.text_area("内部メモ")
-            next_check = st.text_area("次回確認すること")
+            not_decide = st.text_area("今は決めたくないこと", key="case_register_not_decide")
+            first_check = st.text_area("まず確認したいこと", key="case_register_first_check")
+            free_memo = st.text_area("自由メモ", key="case_register_free_memo")
+            internal_memo = st.text_area("内部メモ", key="case_register_internal_memo")
+            next_check = st.text_area("次回確認すること", key="case_register_next_check")
 
-            duplicate_blocked = not duplicate_cases_preview.empty
             submitted = st.form_submit_button("案件を登録", disabled=duplicate_blocked)
 
             if submitted:
+                # 送信直前にも再チェックする。画面表示時とデータ状態が変わっても安全に止める。
                 duplicate_cases = find_duplicate_active_cases_by_client_id(data, client_id)
                 if not duplicate_cases.empty:
                     st.error("登録できません。この相談者には、終了していない案件がすでにあります。既存案件に履歴を追加してください。")
@@ -1281,6 +1295,7 @@ with tabs[2]:
                     data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
                     save_all(data)
                     st.success("案件を登録しました。")
+                    st.rerun()
 
     st.divider()
     st.dataframe(data["cases"], use_container_width=True)
