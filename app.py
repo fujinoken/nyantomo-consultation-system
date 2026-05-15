@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.5.1 伴走支援版
+# にゃんとも相談管理システム Ver2.5.3 伴走支援版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -514,7 +514,7 @@ def init_db():
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5.1')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5.3')")
         conn.executescript('''
         CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
         CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
@@ -1359,6 +1359,11 @@ def export_all_to_excel_bytes():
         "cats": fetch_df("SELECT * FROM cats"),
         "family": fetch_df("SELECT * FROM family"),
         "photos": fetch_df("SELECT * FROM photos"),
+        "ai_summaries": fetch_df("SELECT * FROM ai_summaries"),
+        "line_messages": fetch_df("SELECT * FROM line_messages"),
+        "hearing_checklist": fetch_df("SELECT * FROM hearing_checklist"),
+        "state_changes": fetch_df("SELECT * FROM state_changes"),
+        "follow_suggestions": fetch_df("SELECT * FROM follow_suggestions"),
     }
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for name, df in sheets.items():
@@ -1369,7 +1374,7 @@ def export_all_to_excel_bytes():
 
 
 # -----------------------------
-# Ver2.5.1 安定稼働：インデックス・整合性チェック
+# Ver2.5.3 安定稼働：インデックス・整合性チェック
 # -----------------------------
 def ensure_indexes():
     """検索・関連データ取得を安定化するためのインデックスを作成する。"""
@@ -1409,6 +1414,9 @@ RELATED_TABLES = [
     ("photos", "photo_id"),
     ("ai_summaries", "summary_id"),
     ("line_messages", "message_id"),
+    ("hearing_checklist", "checklist_id"),
+    ("state_changes", "change_id"),
+    ("follow_suggestions", "suggestion_id"),
 ]
 
 
@@ -1791,7 +1799,7 @@ def page_case_register():
 
 
 # -----------------------------
-# Ver2.5.1 伴走支援
+# Ver2.5.3 伴走支援
 # -----------------------------
 def get_table_count_by_case(table, case_id):
     try:
@@ -2022,7 +2030,7 @@ def save_follow_suggestions(case_id, suggestions):
     return count
 
 
-def render_companion_support(case_id):
+def render_companion_support(case_id, key_prefix='main'):
     c = get_case_full(case_id)
     if not c:
         st.error("案件が見つかりません。")
@@ -2051,10 +2059,10 @@ def render_companion_support(case_id):
             for idx, it in enumerate(hearing_items):
                 st.checkbox(
                     f"{it['category']}｜{it['item']}",
-                    key=f"preview_hear_{case_id}_{idx}",
+                    key=f"{key_prefix}_preview_hear_{case_id}_{idx}",
                     disabled=True
                 )
-            if st.button("このヒアリング項目を保存する", key=f"save_hearing_{case_id}", disabled=not has_perm("write")):
+            if st.button("このヒアリング項目を保存する", key=f"{key_prefix}_save_hearing_{case_id}", disabled=not has_perm("write")):
                 cnt = save_generated_hearing_items(case_id, hearing_items)
                 st.success(f"{cnt}件保存しました。")
                 st.rerun()
@@ -2074,11 +2082,11 @@ def render_companion_support(case_id):
             selected = st.selectbox(
                 "チェック更新する項目",
                 [f"{r['category']}｜{r['item']}｜{r['checklist_id']}" for _, r in saved.iterrows()],
-                key=f"checklist_update_select_{case_id}"
+                key=f"{key_prefix}_checklist_update_select_{case_id}"
             )
             checklist_id = selected_id_from_label(selected)
             row = fetch_one("SELECT * FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
-            with st.form(f"checklist_update_form_{checklist_id}"):
+            with st.form(f"{key_prefix}_checklist_update_form_{checklist_id}"):
                 checked = st.selectbox("確認状態", ["0", "1"], index=1 if row.get("checked") == "1" else 0, format_func=lambda x: "確認済" if x == "1" else "未確認")
                 note = st.text_area("確認メモ", value=row.get("note", ""))
                 submitted = st.form_submit_button("チェックリストを更新")
@@ -2122,7 +2130,7 @@ def render_companion_support(case_id):
         st.dataframe(state_df, use_container_width=True)
 
         if has_perm("write"):
-            with st.form(f"state_change_form_{case_id}"):
+            with st.form(f"{key_prefix}_state_change_form_{case_id}"):
                 field_name = st.selectbox("変化した項目", ["急がされ感", "家族温度差", "本人の不安", "住まいの状態", "猫の状況", "ステータス", "その他"])
                 before_value = st.text_input("変化前")
                 after_value = st.text_input("変化後")
@@ -2171,7 +2179,7 @@ def render_companion_support(case_id):
         st.markdown("### 継続フォロー提案")
         fdf = pd.DataFrame(follow)
         st.dataframe(fdf, use_container_width=True)
-        if st.button("このフォロー提案を保存する", key=f"save_follow_{case_id}", disabled=not has_perm("write")):
+        if st.button("このフォロー提案を保存する", key=f"{key_prefix}_save_follow_{case_id}", disabled=not has_perm("write")):
             cnt = save_follow_suggestions(case_id, follow)
             st.success(f"{cnt}件保存しました。")
             st.rerun()
@@ -2189,13 +2197,13 @@ def render_companion_support(case_id):
             selected = st.selectbox(
                 "更新するフォロー",
                 [f"{r['due_date']}｜{r['status']}｜{r['content'][:30]}｜{r['suggestion_id']}" for _, r in saved_follow.iterrows()],
-                key=f"follow_update_select_{case_id}"
+                key=f"{key_prefix}_follow_update_select_{case_id}"
             )
             suggestion_id = selected_id_from_label(selected)
             row = fetch_one("SELECT * FROM follow_suggestions WHERE suggestion_id=:id", {"id": suggestion_id})
-            with st.form(f"follow_update_form_{suggestion_id}"):
+            with st.form(f"{key_prefix}_follow_update_form_{suggestion_id}"):
                 status = st.selectbox("状態", ["未対応", "確認中", "対応済", "保留", "不要"], index=option_index(["未対応", "確認中", "対応済", "保留", "不要"], row.get("status", "")))
-                due_date = st.date_input("期限", value=parse_date_safe(row.get("due_date")), key=f"follow_due_{suggestion_id}")
+                due_date = st.date_input("期限", value=parse_date_safe(row.get("due_date")), key=f"{key_prefix}_follow_due_{suggestion_id}")
                 note = st.text_area("メモ", value=row.get("note", ""))
                 submitted = st.form_submit_button("フォローを更新")
                 if submitted:
@@ -2391,7 +2399,7 @@ def page_case_dashboard():
                 st.text_area("反応メモ", line_row.get("response_memo", ""), height=120, key=f"dash_line_response_{message_id}")
 
     with rel_tabs[7]:
-        render_companion_support(case_id)
+        render_companion_support(case_id, key_prefix='dashboard')
 
     with rel_tabs[8]:
         memo = build_case_memo(case_id)
@@ -2946,7 +2954,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.5.1では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.5.3では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -2958,6 +2966,9 @@ def page_search_update_delete():
         "写真": "photos",
         "AI履歴": "ai_summaries",
         "LINE履歴": "line_messages",
+        "ヒアリング項目": "hearing_checklist",
+        "状態変化ログ": "state_changes",
+        "フォロー提案": "follow_suggestions",
     }
 
     id_cols = {
@@ -2970,6 +2981,9 @@ def page_search_update_delete():
         "photos": "photo_id",
         "ai_summaries": "summary_id",
         "line_messages": "message_id",
+        "hearing_checklist": "checklist_id",
+        "state_changes": "change_id",
+        "follow_suggestions": "suggestion_id",
     }
 
     table_label = st.selectbox("対象データ", list(table_map.keys()), key="sud_table_select")
@@ -3144,6 +3158,35 @@ def page_search_update_delete():
                     update_values["send_status"] = st.selectbox("送信状態", ["下書き保存", "送信予定", "送信済", "送信失敗", "中止"], index=option_index(["下書き保存", "送信予定", "送信済", "送信失敗", "中止"], row.get("send_status", "")))
                     update_values["response_memo"] = st.text_area("反応・メモ", value=row.get("response_memo", ""))
 
+                elif table == "hearing_checklist":
+                    st.text_input("checklist_id", value=row.get("checklist_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["category"] = st.text_input("カテゴリ", value=row.get("category", ""))
+                    update_values["item"] = st.text_area("ヒアリング項目", value=row.get("item", ""), height=120)
+                    update_values["checked"] = st.selectbox("確認状態", ["0", "1"], index=1 if row.get("checked") == "1" else 0, format_func=lambda x: "確認済" if x == "1" else "未確認")
+                    update_values["checked_at"] = st.text_input("確認日時", value=row.get("checked_at", ""))
+                    update_values["note"] = st.text_area("メモ", value=row.get("note", ""))
+                    update_values["source"] = st.text_input("作成元", value=row.get("source", ""))
+
+                elif table == "state_changes":
+                    st.text_input("change_id", value=row.get("change_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["field_name"] = st.text_input("変化項目", value=row.get("field_name", ""))
+                    update_values["before_value"] = st.text_input("変化前", value=row.get("before_value", ""))
+                    update_values["after_value"] = st.text_input("変化後", value=row.get("after_value", ""))
+                    update_values["reason"] = st.text_input("変化のきっかけ", value=row.get("reason", ""))
+                    update_values["memo"] = st.text_area("メモ", value=row.get("memo", ""))
+
+                elif table == "follow_suggestions":
+                    st.text_input("suggestion_id", value=row.get("suggestion_id", ""), disabled=True)
+                    st.text_input("case_id", value=row.get("case_id", ""), disabled=True)
+                    update_values["suggestion_type"] = st.text_input("提案種別", value=row.get("suggestion_type", ""))
+                    update_values["content"] = st.text_area("内容", value=row.get("content", ""), height=140)
+                    update_values["priority"] = st.selectbox("優先度", ["確認", "重要", "低め"], index=option_index(["確認", "重要", "低め"], row.get("priority", "")))
+                    update_values["status"] = st.selectbox("状態", ["未対応", "確認中", "対応済", "保留", "不要"], index=option_index(["未対応", "確認中", "対応済", "保留", "不要"], row.get("status", "")))
+                    update_values["due_date"] = st.text_input("期限", value=row.get("due_date", ""))
+                    update_values["note"] = st.text_area("メモ", value=row.get("note", ""))
+
                 submitted = st.form_submit_button("この内容で更新する")
                 if submitted:
                     update_values = {k: ("" if v is None else v) for k, v in update_values.items()}
@@ -3178,6 +3221,16 @@ def page_search_update_delete():
         removed_files = 0
         if table == "cases":
             removed_files = delete_photo_files_for_case(delete_id)
+        elif table == "clients":
+            client_photos = fetch_df("SELECT saved_path FROM photos WHERE client_id=:client_id", {"client_id": delete_id})
+            for _, p in client_photos.iterrows():
+                path = Path(str(p.get("saved_path", "")))
+                if path.exists() and path.is_file():
+                    try:
+                        path.unlink()
+                        removed_files += 1
+                    except Exception:
+                        pass
         elif table == "photos":
             removed_files = delete_photo_file_by_id(delete_id)
         execute(f"DELETE FROM {table} WHERE {id_col}=:id", {"id": delete_id})
@@ -3463,6 +3516,9 @@ def page_relation_maintenance():
         {"テーブル": "photos", "件数": table_count("photos")},
         {"テーブル": "ai_summaries", "件数": table_count("ai_summaries")},
         {"テーブル": "line_messages", "件数": table_count("line_messages")},
+        {"テーブル": "hearing_checklist", "件数": table_count("hearing_checklist")},
+        {"テーブル": "state_changes", "件数": table_count("state_changes")},
+        {"テーブル": "follow_suggestions", "件数": table_count("follow_suggestions")},
     ])
     st.dataframe(counts, use_container_width=True)
 
@@ -3481,7 +3537,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.5.1.1（伴走支援エラー修正版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.5.3.1（安定稼働版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
