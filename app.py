@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.2.4 安定稼働版
+# にゃんとも相談管理システム Ver2.5 伴走支援版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -463,11 +463,58 @@ def init_db():
             FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS hearing_checklist (
+            checklist_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            created_at TEXT,
+            created_by TEXT,
+            item TEXT,
+            category TEXT,
+            checked TEXT DEFAULT '0',
+            checked_at TEXT,
+            note TEXT,
+            source TEXT,
+            FOREIGN KEY(case_id) REFERENCES cases(case_id) ON DELETE CASCADE,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS state_changes (
+            change_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            created_at TEXT,
+            created_by TEXT,
+            field_name TEXT,
+            before_value TEXT,
+            after_value TEXT,
+            reason TEXT,
+            memo TEXT,
+            FOREIGN KEY(case_id) REFERENCES cases(case_id) ON DELETE CASCADE,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS follow_suggestions (
+            suggestion_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            created_at TEXT,
+            created_by TEXT,
+            suggestion_type TEXT,
+            content TEXT,
+            priority TEXT,
+            status TEXT DEFAULT '未対応',
+            due_date TEXT,
+            note TEXT,
+            FOREIGN KEY(case_id) REFERENCES cases(case_id) ON DELETE CASCADE,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE
+        );
+
         """)
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.2.1')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5')")
         conn.executescript('''
         CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
         CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
@@ -1322,7 +1369,7 @@ def export_all_to_excel_bytes():
 
 
 # -----------------------------
-# Ver2.2.4 安定稼働：インデックス・整合性チェック
+# Ver2.5 安定稼働：インデックス・整合性チェック
 # -----------------------------
 def ensure_indexes():
     """検索・関連データ取得を安定化するためのインデックスを作成する。"""
@@ -1347,6 +1394,9 @@ def ensure_indexes():
         CREATE INDEX IF NOT EXISTS idx_ai_summaries_client_id ON ai_summaries(client_id);
         CREATE INDEX IF NOT EXISTS idx_line_messages_case_id ON line_messages(case_id);
         CREATE INDEX IF NOT EXISTS idx_line_messages_client_id ON line_messages(client_id);
+        CREATE INDEX IF NOT EXISTS idx_hearing_checklist_case_id ON hearing_checklist(case_id);
+        CREATE INDEX IF NOT EXISTS idx_state_changes_case_id ON state_changes(case_id);
+        CREATE INDEX IF NOT EXISTS idx_follow_suggestions_case_id ON follow_suggestions(case_id);
         """)
         conn.commit()
 
@@ -1739,6 +1789,437 @@ def page_case_register():
     st.dataframe(get_cases_df(include_closed=False), use_container_width=True)
 
 
+
+# -----------------------------
+# Ver2.5 伴走支援
+# -----------------------------
+def get_table_count_by_case(table, case_id):
+    try:
+        row = fetch_one(f"SELECT COUNT(*) AS cnt FROM {table} WHERE case_id=:case_id", {"case_id": case_id})
+        return int(row.get("cnt", 0)) if row else 0
+    except Exception:
+        return 0
+
+
+def generate_hearing_items(case_id):
+    c = get_case_full(case_id)
+    if not c:
+        return []
+
+    items = []
+    status = c.get("status", "")
+    house_state = c.get("house_state", "")
+    cat_relation = c.get("cat_relation", "")
+    family_gap = c.get("family_gap", "")
+    pressure = c.get("pressure", "")
+    worries = c.get("worries", "")
+    not_decide = c.get("not_decide", "")
+    first_check = c.get("first_check", "")
+    next_check = c.get("next_check", "")
+
+    def add(category, item):
+        if item not in [x["item"] for x in items]:
+            items.append({"category": category, "item": item})
+
+    add("基本確認", "前回から状況や気持ちに変化があったか。")
+    add("基本確認", "今も『急いで決めたくないこと』は同じか、変わったか。")
+    add("基本確認", "次回までに確認だけならできそうなことは何か。")
+
+    if house_state in ["未選択", ""]:
+        add("住まい", "現在の住まいの状態を確認する。")
+    if house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま", "売却・賃貸を迷っている"]:
+        add("住まい", "郵便物・通風・雨漏り・庭・近隣不安など、空き家の状態に変化がないか。")
+        add("住まい", "鍵の所在、現地確認できる人、緊急時の連絡先を確認する。")
+    if get_table_count_by_case("properties", case_id) == 0 and ("空き家" in worries or house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"]):
+        add("住まい", "空き家カードに登録するため、所在地・状態・管理頻度を確認する。")
+
+    if cat_relation in ["未選択", ""]:
+        add("猫", "猫との関係、現在の世話の体制、今後心配していることを確認する。")
+    if cat_relation in ["猫と暮らしている", "家族の猫がいる", "猫を残して入院・施設入所が心配", "これから猫と暮らしたい"] or "猫" in worries:
+        add("猫", "猫の現在の暮らし、世話をしている人、緊急時の預け先候補を確認する。")
+        add("猫", "猫について『今は決めたくないこと』があるか確認する。")
+    if get_table_count_by_case("cats", case_id) == 0 and ("猫" in cat_relation or "猫" in worries):
+        add("猫", "猫情報カードに登録するため、名前・頭数・年齢・現在の暮らしを確認する。")
+
+    if family_gap in ["未選択", "", "まだ話せていない"]:
+        add("家族", "家族とどこまで話せているか、まだ話せていない相手がいるか確認する。")
+    if family_gap in ["少しある", "かなりある", "まだ話せていない"]:
+        add("家族", "誰が急いでいて、誰が迷っているのかを対立させずに確認する。")
+        add("家族", "相談者本人の希望と家族の希望がどこで違うのか確認する。")
+    if get_table_count_by_case("family", case_id) == 0 and family_gap in ["少しある", "かなりある", "まだ話せていない"]:
+        add("家族", "家族関係メモに登録するため、関係者名・続柄・温度感を確認する。")
+
+    if pressure in ["少しある", "強くある", "自分でも焦っている"]:
+        add("急がされ感", "何に急かされていると感じているか。期限・家族・お金・空き家劣化などを分ける。")
+        add("急がされ感", "本当に急ぐ必要があることと、急がなくてもよいことを分ける。")
+
+    if not not_decide:
+        add("保留", "今は決めたくないことを確認する。")
+    if not first_check:
+        add("保留", "まず確認だけしたいことを確認する。")
+    if not next_check:
+        add("次回", "次回までの小さな確認事項を1〜3個に絞る。")
+
+    return items
+
+
+def generate_missing_warnings(case_id):
+    c = get_case_full(case_id)
+    if not c:
+        return []
+    warnings = []
+
+    def warn(level, item, detail):
+        warnings.append({"level": level, "item": item, "detail": detail})
+
+    for key, label in [
+        ("current_state", "今いちばん近い状態"),
+        ("house_state", "住まいの状態"),
+        ("cat_relation", "猫との関係"),
+        ("family_gap", "家族との温度差"),
+        ("pressure", "急がされている感じ"),
+        ("worries", "気になること"),
+    ]:
+        v = c.get(key, "")
+        if not v or v == "未選択":
+            warn("確認", label, "未確認です。次回ヒアリングで確認すると安全です。")
+
+    if not c.get("next_check_date"):
+        warn("重要", "次回確認日", "未設定です。保留を放置にしないため、確認日を設定してください。")
+    if not c.get("next_check"):
+        warn("確認", "次回確認すること", "未設定です。次回の小さな確認事項を残してください。")
+
+    last_days = get_last_update_days(c.get("updated_at", ""))
+    if last_days is not None and last_days >= 60:
+        warn("重要", "未更新", f"最終更新から{last_days}日経過しています。急かさない形で状況確認を検討してください。")
+
+    house_state = c.get("house_state", "")
+    if house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"] and get_table_count_by_case("properties", case_id) == 0:
+        warn("重要", "空き家カード", "空き家状態に近いですが、空き家カードが未登録です。")
+    if ("猫" in c.get("cat_relation", "") or "猫" in c.get("worries", "")) and get_table_count_by_case("cats", case_id) == 0:
+        warn("確認", "猫情報カード", "猫に関する相談要素がありますが、猫情報カードが未登録です。")
+    if c.get("family_gap", "") in ["少しある", "かなりある", "まだ話せていない"] and get_table_count_by_case("family", case_id) == 0:
+        warn("確認", "家族関係メモ", "家族温度差がありますが、家族関係メモが未登録です。")
+
+    return warnings
+
+
+def generate_do_not_do(case_id):
+    c = get_case_full(case_id)
+    if not c:
+        return []
+    items = []
+    pressure = c.get("pressure", "")
+    family_gap = c.get("family_gap", "")
+    house_state = c.get("house_state", "")
+    cat_relation = c.get("cat_relation", "")
+    worries = c.get("worries", "")
+
+    items.append("売却・賃貸・施設入所などの結論をこちらから急がせない。")
+    items.append("『正解』を提示するより、事実・未確定・保留を分ける。")
+
+    if pressure in ["少しある", "強くある", "自分でも焦っている"]:
+        items.append("焦りがある状態で大きな判断を迫らない。")
+    if family_gap in ["少しある", "かなりある", "まだ話せていない"]:
+        items.append("家族会議や家族間調整を急がせない。まず温度差を言葉にする。")
+    if "猫" in cat_relation or "猫" in worries:
+        items.append("猫の譲渡・別居・預け先の結論を急がない。まず緊急時の選択肢を確認する。")
+    if house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"]:
+        items.append("空き家をすぐ売る・貸す方向に寄せない。まず安全確認と管理状態を把握する。")
+
+    return list(dict.fromkeys(items))
+
+
+def generate_follow_suggestions(case_id):
+    c = get_case_full(case_id)
+    if not c:
+        return []
+    suggestions = []
+
+    def add(kind, content, priority="確認", days=14):
+        due = (date.today() + pd.Timedelta(days=days)).strftime("%Y-%m-%d")
+        suggestions.append({"type": kind, "content": content, "priority": priority, "due_date": due})
+
+    add("短期確認", "次回確認日までに、状況変化がないか短い連絡で確認する。", "確認", 14)
+
+    if c.get("pressure") in ["少しある", "強くある", "自分でも焦っている"]:
+        add("安心形成", "急ぐ話と急がなくてよい話を分けるため、短時間の整理面談を提案する。", "重要", 7)
+    if c.get("house_state") in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"]:
+        add("住まい確認", "空き家の通風・郵便物・外観・近隣不安の確認を提案する。", "重要", 14)
+    if "猫" in c.get("cat_relation", "") or "猫" in c.get("worries", ""):
+        add("猫確認", "猫の世話体制・緊急時の預け先候補を確認する。", "確認", 14)
+    if c.get("family_gap") in ["少しある", "かなりある", "まだ話せていない"]:
+        add("家族温度差", "家族の誰が何を心配しているのか、対立させずに整理する機会を作る。", "確認", 21)
+
+    return suggestions
+
+
+def save_generated_hearing_items(case_id, items):
+    c = get_case_full(case_id)
+    if not c:
+        return 0
+    count = 0
+    for it in items:
+        exists = fetch_one("""
+            SELECT checklist_id FROM hearing_checklist
+            WHERE case_id=:case_id AND item=:item
+            LIMIT 1
+        """, {"case_id": case_id, "item": it["item"]})
+        if exists:
+            continue
+        execute("""
+            INSERT INTO hearing_checklist(checklist_id, case_id, client_id, created_at, created_by,
+                                          item, category, checked, checked_at, note, source)
+            VALUES(:checklist_id, :case_id, :client_id, :created_at, :created_by,
+                   :item, :category, '0', '', '', 'auto')
+        """, {
+            "checklist_id": make_id("hear"),
+            "case_id": case_id,
+            "client_id": c["client_id"],
+            "created_at": now_text(),
+            "created_by": (current_user() or {}).get("username", ""),
+            "item": it["item"],
+            "category": it["category"],
+        })
+        count += 1
+    if count:
+        add_audit_log("save_hearing_items", "case", case_id, f"count={count}")
+    return count
+
+
+def save_follow_suggestions(case_id, suggestions):
+    c = get_case_full(case_id)
+    if not c:
+        return 0
+    count = 0
+    for s in suggestions:
+        exists = fetch_one("""
+            SELECT suggestion_id FROM follow_suggestions
+            WHERE case_id=:case_id AND content=:content
+            LIMIT 1
+        """, {"case_id": case_id, "content": s["content"]})
+        if exists:
+            continue
+        execute("""
+            INSERT INTO follow_suggestions(suggestion_id, case_id, client_id, created_at, created_by,
+                                           suggestion_type, content, priority, status, due_date, note)
+            VALUES(:suggestion_id, :case_id, :client_id, :created_at, :created_by,
+                   :suggestion_type, :content, :priority, '未対応', :due_date, '')
+        """, {
+            "suggestion_id": make_id("follow"),
+            "case_id": case_id,
+            "client_id": c["client_id"],
+            "created_at": now_text(),
+            "created_by": (current_user() or {}).get("username", ""),
+            "suggestion_type": s["type"],
+            "content": s["content"],
+            "priority": s["priority"],
+            "due_date": s["due_date"],
+        })
+        count += 1
+    if count:
+        add_audit_log("save_follow_suggestions", "case", case_id, f"count={count}")
+    return count
+
+
+def render_companion_support(case_id):
+    c = get_case_full(case_id)
+    if not c:
+        st.error("案件が見つかりません。")
+        return
+
+    hearing_items = generate_hearing_items(case_id)
+    warnings = generate_missing_warnings(case_id)
+    dont_do = generate_do_not_do(case_id)
+    follow = generate_follow_suggestions(case_id)
+
+    st.caption("判断を急がせず、次回確認・抜け漏れ・状態変化・継続フォローを支える画面です。")
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("次回ヒアリング案", len(hearing_items))
+    k2.metric("漏れ警告", len(warnings))
+    k3.metric("今やらないこと", len(dont_do))
+    k4.metric("フォロー提案", len(follow))
+
+    support_tabs = st.tabs(["次回ヒアリング", "漏れ警告", "状態変化ログ", "今やらないこと", "継続フォロー"])
+
+    with support_tabs[0]:
+        st.markdown("### 次回ヒアリング項目")
+        if hearing_items:
+            df = pd.DataFrame(hearing_items)
+            st.dataframe(df, use_container_width=True)
+            for it in hearing_items:
+                st.checkbox(f"{it['category']}｜{it['item']}", key=f"preview_hear_{case_id}_{it['item']}", disabled=True)
+            if st.button("このヒアリング項目を保存する", key=f"save_hearing_{case_id}", disabled=not has_perm("write")):
+                cnt = save_generated_hearing_items(case_id, hearing_items)
+                st.success(f"{cnt}件保存しました。")
+                st.rerun()
+        else:
+            st.success("追加で提案するヒアリング項目は少ないです。")
+
+        st.markdown("### 保存済みチェックリスト")
+        saved = fetch_df("""
+            SELECT checklist_id, created_at, category, item, checked, checked_at, note
+            FROM hearing_checklist
+            WHERE case_id=:case_id
+            ORDER BY created_at DESC
+        """, {"case_id": case_id})
+        st.dataframe(saved, use_container_width=True)
+
+        if not saved.empty and has_perm("write"):
+            selected = st.selectbox(
+                "チェック更新する項目",
+                [f"{r['category']}｜{r['item']}｜{r['checklist_id']}" for _, r in saved.iterrows()],
+                key=f"checklist_update_select_{case_id}"
+            )
+            checklist_id = selected_id_from_label(selected)
+            row = fetch_one("SELECT * FROM hearing_checklist WHERE checklist_id=:id", {"id": checklist_id})
+            with st.form(f"checklist_update_form_{checklist_id}"):
+                checked = st.selectbox("確認状態", ["0", "1"], index=1 if row.get("checked") == "1" else 0, format_func=lambda x: "確認済" if x == "1" else "未確認")
+                note = st.text_area("確認メモ", value=row.get("note", ""))
+                submitted = st.form_submit_button("チェックリストを更新")
+                if submitted:
+                    execute("""
+                        UPDATE hearing_checklist
+                        SET checked=:checked, checked_at=:checked_at, note=:note
+                        WHERE checklist_id=:id
+                    """, {
+                        "checked": checked,
+                        "checked_at": now_text() if checked == "1" else "",
+                        "note": note,
+                        "id": checklist_id,
+                    })
+                    touch_case(case_id)
+                    add_audit_log("update_hearing_checklist", "case", case_id, checklist_id)
+                    st.success("更新しました。")
+                    st.rerun()
+
+    with support_tabs[1]:
+        st.markdown("### ヒアリング漏れ警告")
+        if warnings:
+            wdf = pd.DataFrame(warnings)
+            st.dataframe(wdf, use_container_width=True)
+            for w in warnings:
+                if w["level"] == "重要":
+                    st.warning(f"⚠ {w['item']}：{w['detail']}")
+                else:
+                    st.info(f"確認：{w['item']}：{w['detail']}")
+        else:
+            st.success("大きなヒアリング漏れは見つかりません。")
+
+    with support_tabs[2]:
+        st.markdown("### 状態変化ログ")
+        state_df = fetch_df("""
+            SELECT created_at, created_by, field_name, before_value, after_value, reason, memo, change_id
+            FROM state_changes
+            WHERE case_id=:case_id
+            ORDER BY created_at DESC
+        """, {"case_id": case_id})
+        st.dataframe(state_df, use_container_width=True)
+
+        if has_perm("write"):
+            with st.form(f"state_change_form_{case_id}"):
+                field_name = st.selectbox("変化した項目", ["急がされ感", "家族温度差", "本人の不安", "住まいの状態", "猫の状況", "ステータス", "その他"])
+                before_value = st.text_input("変化前")
+                after_value = st.text_input("変化後")
+                reason = st.text_input("変化のきっかけ")
+                memo = st.text_area("メモ")
+                submitted = st.form_submit_button("状態変化を記録")
+                if submitted:
+                    execute("""
+                        INSERT INTO state_changes(change_id, case_id, client_id, created_at, created_by,
+                                                  field_name, before_value, after_value, reason, memo)
+                        VALUES(:change_id, :case_id, :client_id, :created_at, :created_by,
+                               :field_name, :before_value, :after_value, :reason, :memo)
+                    """, {
+                        "change_id": make_id("chg"),
+                        "case_id": case_id,
+                        "client_id": c["client_id"],
+                        "created_at": now_text(),
+                        "created_by": (current_user() or {}).get("username", ""),
+                        "field_name": field_name,
+                        "before_value": before_value,
+                        "after_value": after_value,
+                        "reason": reason,
+                        "memo": memo,
+                    })
+                    touch_case(case_id)
+                    add_audit_log("add_state_change", "case", case_id, field_name)
+                    st.success("状態変化を記録しました。")
+                    st.rerun()
+
+        st.markdown("### ステータス履歴")
+        hist = fetch_df("""
+            SELECT record_date, record_type, before_status, after_status, record
+            FROM history
+            WHERE case_id=:case_id
+            ORDER BY record_date DESC, created_at DESC
+        """, {"case_id": case_id})
+        st.dataframe(hist, use_container_width=True)
+
+    with support_tabs[3]:
+        st.markdown("### 今やらない方がいいこと")
+        for item in dont_do:
+            st.warning(f"・{item}")
+        st.caption("これは禁止ではなく、相談者の判断を奪わないための安全装置です。")
+
+    with support_tabs[4]:
+        st.markdown("### 継続フォロー提案")
+        fdf = pd.DataFrame(follow)
+        st.dataframe(fdf, use_container_width=True)
+        if st.button("このフォロー提案を保存する", key=f"save_follow_{case_id}", disabled=not has_perm("write")):
+            cnt = save_follow_suggestions(case_id, follow)
+            st.success(f"{cnt}件保存しました。")
+            st.rerun()
+
+        st.markdown("### 保存済みフォロー")
+        saved_follow = fetch_df("""
+            SELECT suggestion_id, created_at, suggestion_type, priority, status, due_date, content, note
+            FROM follow_suggestions
+            WHERE case_id=:case_id
+            ORDER BY due_date ASC, created_at DESC
+        """, {"case_id": case_id})
+        st.dataframe(saved_follow, use_container_width=True)
+
+        if not saved_follow.empty and has_perm("write"):
+            selected = st.selectbox(
+                "更新するフォロー",
+                [f"{r['due_date']}｜{r['status']}｜{r['content'][:30]}｜{r['suggestion_id']}" for _, r in saved_follow.iterrows()],
+                key=f"follow_update_select_{case_id}"
+            )
+            suggestion_id = selected_id_from_label(selected)
+            row = fetch_one("SELECT * FROM follow_suggestions WHERE suggestion_id=:id", {"id": suggestion_id})
+            with st.form(f"follow_update_form_{suggestion_id}"):
+                status = st.selectbox("状態", ["未対応", "確認中", "対応済", "保留", "不要"], index=option_index(["未対応", "確認中", "対応済", "保留", "不要"], row.get("status", "")))
+                due_date = st.date_input("期限", value=parse_date_safe(row.get("due_date")), key=f"follow_due_{suggestion_id}")
+                note = st.text_area("メモ", value=row.get("note", ""))
+                submitted = st.form_submit_button("フォローを更新")
+                if submitted:
+                    execute("""
+                        UPDATE follow_suggestions
+                        SET status=:status, due_date=:due_date, note=:note
+                        WHERE suggestion_id=:id
+                    """, {
+                        "status": status,
+                        "due_date": date_or_blank(due_date),
+                        "note": note,
+                        "id": suggestion_id,
+                    })
+                    touch_case(case_id)
+                    add_audit_log("update_follow_suggestion", "case", case_id, suggestion_id)
+                    st.success("更新しました。")
+                    st.rerun()
+
+
+def page_companion_support():
+    st.subheader("🤝 伴走支援")
+    case_id = select_case_widget("companion_case_select", include_closed=True)
+    if not case_id:
+        return
+    render_companion_support(case_id)
+
+
+
 def page_case_dashboard():
     st.subheader("🗂 案件ダッシュボード")
     case_id = select_case_widget("dash_case_select", include_closed=True)
@@ -1835,7 +2316,7 @@ def page_case_dashboard():
 
     st.divider()
     st.markdown("### この案件に紐づくデータ")
-    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "LINE履歴", "AI/PDF用メモ", "管理者アドバイス"])
+    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "LINE履歴", "伴走支援", "AI/PDF用メモ", "管理者アドバイス"])
 
     with rel_tabs[0]:
         st.dataframe(fetch_df("SELECT * FROM clients WHERE client_id=:client_id", {"client_id": c["client_id"]}), use_container_width=True)
@@ -1906,11 +2387,14 @@ def page_case_dashboard():
                 st.text_area("反応メモ", line_row.get("response_memo", ""), height=120, key=f"dash_line_response_{message_id}")
 
     with rel_tabs[7]:
+        render_companion_support(case_id)
+
+    with rel_tabs[8]:
         memo = build_case_memo(case_id)
         st.text_area("案件統合メモ", memo, height=500)
         st.download_button("この案件のPDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_case_{case_id}.pdf", mime="application/pdf")
 
-    with rel_tabs[8]:
+    with rel_tabs[9]:
         advice = build_management_advice(case_id)
         st.text_area("管理者向け対応アドバイス案", advice, height=500)
         st.download_button("対応アドバイスPDFをダウンロード", make_pdf_bytes(advice), file_name=f"nyantomo_advice_{case_id}.pdf", mime="application/pdf")
@@ -2458,7 +2942,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.2.4では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.5では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -2993,7 +3477,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.2.4（安定稼働版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.5（伴走支援版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
@@ -3010,6 +3494,7 @@ tabs = st.tabs([
     "🧑 相談者登録",
     "📝 案件登録",
     "🗂 案件ダッシュボード",
+    "🤝 伴走支援",
     "📚 相談履歴",
     "⏸ 保留案件一覧",
     "🏠 空き家カード",
@@ -3035,30 +3520,32 @@ with tabs[2]:
 with tabs[3]:
     page_case_dashboard()
 with tabs[4]:
-    page_history()
+    page_companion_support()
 with tabs[5]:
-    page_hold_list()
+    page_history()
 with tabs[6]:
-    page_property()
+    page_hold_list()
 with tabs[7]:
-    page_map()
+    page_property()
 with tabs[8]:
-    page_cat()
+    page_map()
 with tabs[9]:
-    page_family()
+    page_cat()
 with tabs[10]:
-    page_photos()
+    page_family()
 with tabs[11]:
-    page_ai_pdf()
+    page_photos()
 with tabs[12]:
-    page_search_update_delete()
+    page_ai_pdf()
 with tabs[13]:
-    page_data_management()
+    page_search_update_delete()
 with tabs[14]:
-    page_relation_maintenance()
+    page_data_management()
 with tabs[15]:
-    page_user_management()
+    page_relation_maintenance()
 with tabs[16]:
-    page_line_linkage()
+    page_user_management()
 with tabs[17]:
+    page_line_linkage()
+with tabs[18]:
     page_ai_history()
