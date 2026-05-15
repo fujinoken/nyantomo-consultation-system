@@ -78,6 +78,82 @@ STATUS_ORDER = [
 ]
 
 
+# ---------------------------------------------------------
+# Ver1.6.4 追加：更新画面のプルダウン化
+# ---------------------------------------------------------
+CHOICE_OPTIONS = {
+    "年代": ["未選択", "40代", "50代", "60代", "70代", "80代以上"],
+    "連絡方法": ["未選択", "LINE", "メール", "電話", "対面", "その他"],
+    "相談者の立場": ["未選択", "本人", "家族", "親族", "空き家所有者", "支援者", "その他"],
+    "案件種別": ["初回相談", "空き家管理", "猫と住まい", "相続前整理", "高齢期の住まい", "その他"],
+    "現在ステータス": STATUS_ORDER,
+    "状態変更前": STATUS_ORDER,
+    "状態変更後": STATUS_ORDER,
+    "今いちばん近い状態": ["未選択", "まだ何も決まっていない", "少し考え始めている", "家族と話し始めた", "急かされている感じがある", "誰にも相談していない", "すでに困りごとが出ている"],
+    "住まいの状態": ["未選択", "現在住んでいる", "空き家になっている", "近いうちに空き家になりそう", "相続後そのまま", "売却・賃貸を迷っている", "荷物整理が進んでいない"],
+    "猫との関係": ["未選択", "猫と暮らしている", "家族の猫がいる", "猫を残して入院・施設入所が心配", "これから猫と暮らしたい", "保護猫に関心がある", "猫はいない"],
+    "家族との温度差": ["未選択", "特にない", "少しある", "かなりある", "まだ話せていない"],
+    "急がされている感じ": ["未選択", "ない", "少しある", "強くある", "自分でも焦っている"],
+    "記録種別": ["案件登録", "相談", "電話", "LINE", "メール", "面談", "現地確認", "状態変更", "終了確認", "その他"],
+    "物件状態": ["未確認", "居住中", "空き家", "一部使用", "売却検討", "賃貸検討", "その他"],
+    "空き家状態": ["未確認", "問題なし", "定期確認必要", "劣化あり", "近隣不安あり", "緊急確認必要"],
+    "鍵預かり": ["未確認", "なし", "あり", "検討中"],
+    "近隣不安": ["未確認", "なし", "少しあり", "強くあり"],
+    "管理頻度": ["未設定", "月1回", "月2回", "必要時", "一時確認のみ"],
+    "現在の暮らし": ["未確認", "本人と同居", "家族と同居", "一時預かり中", "今後検討", "その他"],
+    "連絡可否": ["未確認", "連絡可", "連絡不可", "本人経由のみ"],
+    "温度感": ["未確認", "協力的", "中立", "慎重", "反対気味", "不明"],
+    "写真種別": ["外観", "室内", "郵便受け", "庭", "猫", "書類", "その他"],
+}
+
+WORRY_OPTIONS = [
+    "空き家管理", "相続", "売却", "賃貸", "猫の住まい", "高齢期の暮らし",
+    "家族との意見の違い", "お金", "近所への不安", "何から考えればよいか分からない"
+]
+
+
+def select_options_with_current(options, current_value):
+    options = list(options)
+    current_value = str(current_value).strip()
+    if current_value and current_value not in options:
+        options = [current_value] + options
+    return options
+
+
+def parse_date_for_input(value):
+    parsed = parse_date_safe(value) if 'parse_date_safe' in globals() else None
+    return parsed or date.today()
+
+
+def render_crud_edit_input(table_key, col, value):
+    """検索・更新画面で、選択肢がある項目はプルダウン化して入力ミスを減らす。"""
+    key = f"crud_edit_{table_key}_{col}"
+    value = str(value or "")
+
+    if col in ["相談日", "記録日"]:
+        selected_date = st.date_input(col, value=parse_date_for_input(value), key=key)
+        return selected_date.strftime("%Y-%m-%d")
+
+    if table_key == "cases" and col == "気になること":
+        current_items = [x.strip() for x in value.replace("，", "、").split("、") if x.strip()]
+        options = list(WORRY_OPTIONS)
+        for item in current_items:
+            if item not in options:
+                options.append(item)
+        selected = st.multiselect(col, options, default=current_items, key=key)
+        return "、".join(selected)
+
+    if col in CHOICE_OPTIONS:
+        options = select_options_with_current(CHOICE_OPTIONS[col], value)
+        index = options.index(value) if value in options else 0
+        return st.selectbox(col, options, index=index, key=key)
+
+    if len(value) > 35 or "メモ" in col or "こと" in col or "記録" in col or "説明" in col or "アクション" in col:
+        return st.text_area(col, value=value, height=100, key=key)
+
+    return st.text_input(col, value=value, key=key)
+
+
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
@@ -593,10 +669,7 @@ def render_search_update_delete(data):
                         st.text_input(col, value=value, disabled=True)
                         new_values[col] = value
                     else:
-                        if len(value) > 35 or "メモ" in col or "こと" in col or "記録" in col or "説明" in col:
-                            new_values[col] = st.text_area(col, value=value, height=100)
-                        else:
-                            new_values[col] = st.text_input(col, value=value)
+                        new_values[col] = render_crud_edit_input(table_key, col, value)
 
                 submitted = st.form_submit_button("この内容で更新する")
                 if submitted:
@@ -1104,7 +1177,7 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6.3（重複判定安定版）")
+st.title("🐾 にゃんとも相談管理システム Ver1.6.4（プルダウン更新対応版）")
 st.caption("相談を保留のまま管理する現場OS｜相談者選択をフォーム外に出し、重複判定を安定化")
 
 tabs = st.tabs([
