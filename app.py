@@ -1177,8 +1177,51 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6.4（プルダウン更新対応版）")
-st.caption("相談を保留のまま管理する現場OS｜相談者選択をフォーム外に出し、重複判定を安定化")
+st.title("🐾 にゃんとも相談管理システム Ver1.6.5（二行メニュー対応版）")
+st.caption("相談を保留のまま管理する現場OS｜メニュー二行表示・視認性改善版")
+
+# ---------------------------------------------------------
+# Ver1.6.5 追加：メニュー二行表示・視認性改善
+# ---------------------------------------------------------
+st.markdown("""
+<style>
+/* タブメニューを折り返して二行表示しやすくする */
+div[data-testid="stTabs"] div[role="tablist"] {
+    flex-wrap: wrap;
+    gap: 6px 8px;
+    border-bottom: 1px solid #e5e7eb;
+    padding-bottom: 8px;
+}
+
+div[data-testid="stTabs"] button[role="tab"] {
+    min-width: auto;
+    padding: 7px 10px;
+    border-radius: 999px;
+    border: 1px solid #e5e7eb;
+    background: #ffffff;
+    font-size: 0.88rem;
+}
+
+div[data-testid="stTabs"] button[aria-selected="true"] {
+    background: #fff7ed;
+    border-color: #fb923c;
+    color: #9a3412;
+    font-weight: 700;
+}
+
+div[data-testid="stTabs"] button[role="tab"] p {
+    margin: 0;
+}
+
+/* 狭い画面では少し小さめにして2行に収まりやすくする */
+@media (max-width: 1100px) {
+    div[data-testid="stTabs"] button[role="tab"] {
+        padding: 6px 8px;
+        font-size: 0.78rem;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
 
 tabs = st.tabs([
     "🏡 案件ホーム",
