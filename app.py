@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.2 AI対応アドバイス版
+# にゃんとも相談管理システム Ver2.2.1 リレーション安定版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -467,7 +467,19 @@ def init_db():
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.2')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.2.1')")
+        conn.executescript('''
+        CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
+        CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
+        CREATE INDEX IF NOT EXISTS idx_cases_next_check_date ON cases(next_check_date);
+        CREATE INDEX IF NOT EXISTS idx_history_case_id ON history(case_id);
+        CREATE INDEX IF NOT EXISTS idx_properties_case_id ON properties(case_id);
+        CREATE INDEX IF NOT EXISTS idx_cats_case_id ON cats(case_id);
+        CREATE INDEX IF NOT EXISTS idx_family_case_id ON family(case_id);
+        CREATE INDEX IF NOT EXISTS idx_photos_case_id ON photos(case_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_summaries_case_id ON ai_summaries(case_id);
+        CREATE INDEX IF NOT EXISTS idx_line_messages_case_id ON line_messages(case_id);
+        ''')
         conn.commit()
 
 
@@ -662,6 +674,144 @@ def import_excel_to_sqlite(excel_bytes=None):
         conn.commit()
     return imported
 
+
+
+# -----------------------------
+# リレーション整合性チェック・修復
+# -----------------------------
+def relation_health_check():
+    """DB内の親子関係・client_id不一致・写真ファイル有無を確認する。"""
+    checks = []
+
+    queries = [
+        ("cases_without_client", "案件に対応する相談者が存在しない", """
+            SELECT c.case_id AS id, c.client_id, c.case_title AS title
+            FROM cases c LEFT JOIN clients cl ON c.client_id = cl.client_id
+            WHERE cl.client_id IS NULL
+        """),
+        ("history_without_case", "履歴に対応する案件が存在しない", """
+            SELECT h.history_id AS id, h.case_id, h.client_id, h.record AS title
+            FROM history h LEFT JOIN cases c ON h.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+        ("properties_without_case", "空き家カードに対応する案件が存在しない", """
+            SELECT p.property_id AS id, p.case_id, p.client_id, p.property_name AS title
+            FROM properties p LEFT JOIN cases c ON p.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+        ("cats_without_case", "猫情報に対応する案件が存在しない", """
+            SELECT ca.cat_id AS id, ca.case_id, ca.client_id, ca.cat_name AS title
+            FROM cats ca LEFT JOIN cases c ON ca.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+        ("family_without_case", "家族メモに対応する案件が存在しない", """
+            SELECT f.family_id AS id, f.case_id, f.client_id, f.person_name AS title
+            FROM family f LEFT JOIN cases c ON f.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+        ("photos_without_case", "写真に対応する案件が存在しない", """
+            SELECT p.photo_id AS id, p.case_id, p.client_id, p.original_filename AS title
+            FROM photos p LEFT JOIN cases c ON p.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+        ("ai_without_case", "AI履歴に対応する案件が存在しない", """
+            SELECT a.summary_id AS id, a.case_id, a.client_id, a.summary_type AS title
+            FROM ai_summaries a LEFT JOIN cases c ON a.case_id = c.case_id
+            WHERE c.case_id IS NULL
+        """),
+    ]
+
+    for code, label, sql in queries:
+        df = fetch_df(sql)
+        if not df.empty:
+            df.insert(0, "check", label)
+            checks.append(df)
+
+    mismatch_queries = [
+        ("history_client_mismatch", "履歴のclient_idが案件のclient_idと不一致", "history", "history_id"),
+        ("properties_client_mismatch", "空き家カードのclient_idが案件のclient_idと不一致", "properties", "property_id"),
+        ("cats_client_mismatch", "猫情報のclient_idが案件のclient_idと不一致", "cats", "cat_id"),
+        ("family_client_mismatch", "家族メモのclient_idが案件のclient_idと不一致", "family", "family_id"),
+        ("photos_client_mismatch", "写真のclient_idが案件のclient_idと不一致", "photos", "photo_id"),
+        ("ai_client_mismatch", "AI履歴のclient_idが案件のclient_idと不一致", "ai_summaries", "summary_id"),
+    ]
+    for code_name, label, table, id_col in mismatch_queries:
+        df = fetch_df(f"""
+            SELECT t.{id_col} AS id, t.case_id, t.client_id AS child_client_id, c.client_id AS case_client_id
+            FROM {table} t JOIN cases c ON t.case_id = c.case_id
+            WHERE COALESCE(t.client_id, '') != COALESCE(c.client_id, '')
+        """)
+        if not df.empty:
+            df.insert(0, "check", label)
+            checks.append(df)
+
+    photo_df = fetch_df("SELECT photo_id AS id, case_id, client_id, saved_path FROM photos WHERE saved_path IS NOT NULL AND saved_path != ''")
+    missing_photos = []
+    for _, r in photo_df.iterrows():
+        if not Path(str(r.get("saved_path", ""))).exists():
+            missing_photos.append(dict(r))
+    if missing_photos:
+        df = pd.DataFrame(missing_photos)
+        df.insert(0, "check", "写真DBはあるがファイルが存在しない")
+        checks.append(df)
+
+    if checks:
+        return pd.concat(checks, ignore_index=True, sort=False)
+    return pd.DataFrame(columns=["check", "id", "case_id", "client_id", "title"])
+
+
+def repair_child_client_ids():
+    """case_idを正として、子テーブルのclient_idを案件側に揃える。"""
+    updated = {}
+    targets = [
+        ("history", "history_id"),
+        ("properties", "property_id"),
+        ("cats", "cat_id"),
+        ("family", "family_id"),
+        ("photos", "photo_id"),
+        ("ai_summaries", "summary_id"),
+        ("line_messages", "message_id"),
+    ]
+    with get_conn() as conn:
+        for table, id_col in targets:
+            cur = conn.execute(f"""
+                UPDATE {table}
+                SET client_id = (SELECT client_id FROM cases WHERE cases.case_id = {table}.case_id)
+                WHERE case_id IS NOT NULL
+                  AND EXISTS (SELECT 1 FROM cases WHERE cases.case_id = {table}.case_id)
+                  AND COALESCE(client_id, '') != COALESCE((SELECT client_id FROM cases WHERE cases.case_id = {table}.case_id), '')
+            """)
+            updated[table] = cur.rowcount
+        conn.commit()
+    add_audit_log("repair_relations", "database", "sqlite", str(updated))
+    return updated
+
+
+def delete_photo_files_for_case(case_id):
+    photo_df = fetch_df("SELECT saved_path FROM photos WHERE case_id=:case_id", {"case_id": case_id})
+    removed = 0
+    for _, r in photo_df.iterrows():
+        path = Path(str(r.get("saved_path", "")))
+        if path.exists() and path.is_file():
+            try:
+                path.unlink()
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+def delete_photo_file_by_id(photo_id):
+    row = fetch_one("SELECT saved_path FROM photos WHERE photo_id=:photo_id", {"photo_id": photo_id})
+    if row:
+        path = Path(str(row.get("saved_path", "")))
+        if path.exists() and path.is_file():
+            try:
+                path.unlink()
+                return 1
+            except Exception:
+                return 0
+    return 0
 
 # -----------------------------
 # データ取得
@@ -1111,7 +1261,7 @@ def make_backup_zip_bytes():
                     z.write(path, path.as_posix())
         meta = {
             "app": "nyantomo-consultation-system",
-            "version": "2.2",
+            "version": "2.2.1",
             "created_at": now_text(),
             "files": [DB_FILE.name, "photos/"]
         }
@@ -1137,6 +1287,9 @@ def restore_backup_zip(uploaded_file):
 
     photos_path = temp_dir / "photos"
     if photos_path.exists():
+        # 復元時は古い写真ファイルの取り残しを避けるため、photosを入れ替える
+        if PHOTO_DIR.exists():
+            shutil.rmtree(PHOTO_DIR, ignore_errors=True)
         PHOTO_DIR.mkdir(exist_ok=True)
         for p in photos_path.rglob("*"):
             if p.is_file():
@@ -2130,8 +2283,14 @@ def page_search_update_delete():
         delete_id = st.selectbox("削除するID", df[id_col].astype(str).tolist(), key=f"delete_{table}")
         confirm = st.checkbox("本当に削除します", key=f"confirm_delete_{table}")
         if st.button("削除する", type="primary", disabled=not confirm):
+            removed_files = 0
+            if table == "cases":
+                removed_files = delete_photo_files_for_case(delete_id)
+            elif table == "photos":
+                removed_files = delete_photo_file_by_id(delete_id)
             execute(f"DELETE FROM {table} WHERE {id_col}=:id", {"id": delete_id})
-            st.success("削除しました。")
+            add_audit_log("delete_record", table, delete_id, f"removed_photo_files={removed_files}")
+            st.success(f"削除しました。写真ファイル削除：{removed_files}件")
             st.rerun()
 
 
@@ -2143,6 +2302,18 @@ def page_data_management():
     c1.metric("相談者", table_count("clients"))
     c2.metric("案件", table_count("cases"))
     c3.metric("履歴", table_count("history"))
+
+    st.markdown("### リレーション整合性チェック")
+    health_df = relation_health_check()
+    if health_df.empty:
+        st.success("リレーションに大きな問題は見つかりません。")
+    else:
+        st.warning(f"確認が必要なデータが {len(health_df)} 件あります。")
+        st.dataframe(health_df, use_container_width=True)
+        if st.button("case_idを基準にclient_id不一致を自動修復する"):
+            result = repair_child_client_ids()
+            st.success(f"修復しました：{result}")
+            st.rerun()
 
     st.markdown("### バックアップ")
     backup_bytes = make_backup_zip_bytes()
@@ -2371,7 +2542,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.2（AI対応アドバイス版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.2.1（リレーション安定版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
