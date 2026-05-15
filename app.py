@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.5 伴走支援版
+# にゃんとも相談管理システム Ver2.5.1 伴走支援版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -514,7 +514,7 @@ def init_db():
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.5.1')")
         conn.executescript('''
         CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
         CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
@@ -1369,7 +1369,7 @@ def export_all_to_excel_bytes():
 
 
 # -----------------------------
-# Ver2.5 安定稼働：インデックス・整合性チェック
+# Ver2.5.1 安定稼働：インデックス・整合性チェック
 # -----------------------------
 def ensure_indexes():
     """検索・関連データ取得を安定化するためのインデックスを作成する。"""
@@ -1791,7 +1791,7 @@ def page_case_register():
 
 
 # -----------------------------
-# Ver2.5 伴走支援
+# Ver2.5.1 伴走支援
 # -----------------------------
 def get_table_count_by_case(table, case_id):
     try:
@@ -2048,8 +2048,12 @@ def render_companion_support(case_id):
         if hearing_items:
             df = pd.DataFrame(hearing_items)
             st.dataframe(df, use_container_width=True)
-            for it in hearing_items:
-                st.checkbox(f"{it['category']}｜{it['item']}", key=f"preview_hear_{case_id}_{it['item']}", disabled=True)
+            for idx, it in enumerate(hearing_items):
+                st.checkbox(
+                    f"{it['category']}｜{it['item']}",
+                    key=f"preview_hear_{case_id}_{idx}",
+                    disabled=True
+                )
             if st.button("このヒアリング項目を保存する", key=f"save_hearing_{case_id}", disabled=not has_perm("write")):
                 cnt = save_generated_hearing_items(case_id, hearing_items)
                 st.success(f"{cnt}件保存しました。")
@@ -2942,7 +2946,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.5では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.5.1では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -3477,7 +3481,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.5（伴走支援版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.5.1.1（伴走支援エラー修正版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
