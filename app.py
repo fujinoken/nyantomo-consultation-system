@@ -9,6 +9,9 @@ import io
 import zipfile
 import shutil
 import json
+import hashlib
+import hmac
+import secrets
 from urllib.parse import quote_plus
 
 from reportlab.pdfgen import canvas
@@ -18,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.0 SQLite版
+# にゃんとも相談管理システム Ver2.1 権限・AI履歴・LINE連携準備版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -149,6 +152,123 @@ def selected_id_from_label(label):
     if not label or "｜" not in label:
         return ""
     return label.split("｜")[-1].strip()
+
+
+
+
+# -----------------------------
+# ログイン・権限管理
+# -----------------------------
+ROLE_OPTIONS = ["管理者", "編集者", "閲覧者"]
+ROLE_PERMISSIONS = {
+    "管理者": {"read": True, "write": True, "delete": True, "admin": True, "line": True, "ai": True},
+    "編集者": {"read": True, "write": True, "delete": False, "admin": False, "line": True, "ai": True},
+    "閲覧者": {"read": True, "write": False, "delete": False, "admin": False, "line": False, "ai": False},
+}
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
+    return f"{salt}${digest.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+        new_digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000).hex()
+        return hmac.compare_digest(new_digest, digest)
+    except Exception:
+        return False
+
+def ensure_default_admin():
+    row = fetch_one("SELECT COUNT(*) AS cnt FROM users")
+    if row and int(row["cnt"]) == 0:
+        execute("""
+            INSERT INTO users(user_id, username, display_name, password_hash, role, is_active, created_at)
+            VALUES(:user_id, :username, :display_name, :password_hash, :role, '1', :created_at)
+        """, {
+            "user_id": make_id("user"),
+            "username": "admin",
+            "display_name": "管理者",
+            "password_hash": hash_password("nyantomo2026"),
+            "role": "管理者",
+            "created_at": now_text(),
+        })
+
+def current_user():
+    return st.session_state.get("user")
+
+def has_perm(permission: str) -> bool:
+    user = current_user()
+    if not user:
+        return False
+    role = user.get("role", "閲覧者")
+    return ROLE_PERMISSIONS.get(role, {}).get(permission, False)
+
+def require_write():
+    if not has_perm("write"):
+        st.warning("閲覧権限のみのため、この操作はできません。")
+        return False
+    return True
+
+def require_admin():
+    if not has_perm("admin"):
+        st.warning("管理者のみ操作できます。")
+        return False
+    return True
+
+def add_audit_log(action, target_type="", target_id="", detail=""):
+    user = current_user() or {}
+    try:
+        execute("""
+            INSERT INTO audit_logs(log_id, user_id, username, action, target_type, target_id, detail, created_at)
+            VALUES(:log_id, :user_id, :username, :action, :target_type, :target_id, :detail, :created_at)
+        """, {
+            "log_id": make_id("log"),
+            "user_id": user.get("user_id", ""),
+            "username": user.get("username", ""),
+            "action": action,
+            "target_type": target_type,
+            "target_id": target_id,
+            "detail": detail,
+            "created_at": now_text(),
+        })
+    except Exception:
+        pass
+
+def login_screen():
+    st.title("🐾 にゃんとも相談管理システム")
+    st.subheader("ログイン")
+    st.caption("初期ユーザー：admin ／ 初期パスワード：nyantomo2026")
+    with st.form("login_form"):
+        username = st.text_input("ユーザー名")
+        password = st.text_input("パスワード", type="password")
+        submitted = st.form_submit_button("ログイン")
+        if submitted:
+            user = fetch_one("SELECT * FROM users WHERE username=:username AND is_active='1'", {"username": username})
+            if user and verify_password(password, user["password_hash"]):
+                st.session_state["user"] = {
+                    "user_id": user["user_id"],
+                    "username": user["username"],
+                    "display_name": user.get("display_name", ""),
+                    "role": user["role"],
+                }
+                add_audit_log("login", "user", user["user_id"], "ログイン")
+                st.success("ログインしました。")
+                st.rerun()
+            else:
+                st.error("ユーザー名またはパスワードが違います。")
+
+def logout_button():
+    user = current_user()
+    if user:
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.caption(f"ログイン中：{user.get('display_name') or user.get('username')} ／ 権限：{user.get('role')}")
+        with c2:
+            if st.button("ログアウト"):
+                add_audit_log("logout", "user", user.get("user_id", ""), "ログアウト")
+                st.session_state.pop("user", None)
+                st.rerun()
 
 
 # -----------------------------
@@ -282,11 +402,72 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            display_name TEXT,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL,
+            is_active TEXT DEFAULT '1',
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            log_id TEXT PRIMARY KEY,
+            user_id TEXT,
+            username TEXT,
+            action TEXT,
+            target_type TEXT,
+            target_id TEXT,
+            detail TEXT,
+            created_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS ai_summaries (
+            summary_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            created_at TEXT,
+            created_by TEXT,
+            summary_type TEXT,
+            source_memo TEXT,
+            ai_prompt TEXT,
+            ai_result TEXT,
+            note TEXT,
+            FOREIGN KEY(case_id) REFERENCES cases(case_id) ON DELETE CASCADE,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS line_settings (
+            setting_id TEXT PRIMARY KEY,
+            channel_access_token TEXT,
+            channel_secret TEXT,
+            default_to TEXT,
+            enabled TEXT DEFAULT '0',
+            note TEXT,
+            updated_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS line_messages (
+            message_id TEXT PRIMARY KEY,
+            case_id TEXT,
+            client_id TEXT,
+            created_at TEXT,
+            created_by TEXT,
+            to_target TEXT,
+            message_text TEXT,
+            send_status TEXT,
+            response_memo TEXT,
+            FOREIGN KEY(case_id) REFERENCES cases(case_id) ON DELETE SET NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id) ON DELETE SET NULL
+        );
+
         """)
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.0')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.1')")
         conn.commit()
 
 
@@ -930,7 +1111,7 @@ def make_backup_zip_bytes():
                     z.write(path, path.as_posix())
         meta = {
             "app": "nyantomo-consultation-system",
-            "version": "2.0",
+            "version": "2.1",
             "created_at": now_text(),
             "files": [DB_FILE.name, "photos/"]
         }
@@ -1597,6 +1778,38 @@ def page_ai_pdf():
     st.text_area("AIに貼り付ける用プロンプト", prompt, height=420)
     st.warning("個人情報を外部AIへ入力する場合は、匿名化・伏せ字化してから使用してください。")
 
+    st.markdown("### AI要約履歴")
+    c = get_case_full(case_id)
+    with st.form(f"ai_summary_save_{case_id}"):
+        summary_type = st.selectbox("要約種別", ["内部整理", "相談者向け要約", "家族共有用", "次回確認用", "その他"])
+        ai_result = st.text_area("AIで作成した要約を貼り付け", height=220)
+        note = st.text_area("補足メモ")
+        submitted = st.form_submit_button("AI要約履歴を保存", disabled=not has_perm("ai"))
+        if submitted:
+            execute("""
+                INSERT INTO ai_summaries(summary_id, case_id, client_id, created_at, created_by,
+                                         summary_type, source_memo, ai_prompt, ai_result, note)
+                VALUES(:summary_id, :case_id, :client_id, :created_at, :created_by,
+                       :summary_type, :source_memo, :ai_prompt, :ai_result, :note)
+            """, {
+                "summary_id": make_id("ai"),
+                "case_id": case_id,
+                "client_id": c["client_id"],
+                "created_at": now_text(),
+                "created_by": (current_user() or {}).get("username", ""),
+                "summary_type": summary_type,
+                "source_memo": memo,
+                "ai_prompt": prompt,
+                "ai_result": ai_result,
+                "note": note,
+            })
+            add_audit_log("save_ai_summary", "case", case_id, summary_type)
+            st.success("AI要約履歴を保存しました。")
+            st.rerun()
+
+    hist = fetch_df("SELECT created_at, created_by, summary_type, ai_result, note, summary_id FROM ai_summaries WHERE case_id=:case_id ORDER BY created_at DESC", {"case_id": case_id})
+    st.dataframe(hist, use_container_width=True)
+
     st.download_button("PDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_memo_{case_id}.pdf", mime="application/pdf")
 
 
@@ -1749,13 +1962,189 @@ def page_data_management():
         st.write(f"サイズ：{DB_FILE.stat().st_size:,} bytes")
 
 
+
+
+def page_user_management():
+    st.subheader("🔐 ログイン・権限管理")
+    if not require_admin():
+        return
+
+    st.markdown("### ユーザー追加")
+    with st.form("add_user_form"):
+        username = st.text_input("ユーザー名")
+        display_name = st.text_input("表示名")
+        password = st.text_input("初期パスワード", type="password")
+        role = st.selectbox("権限", ROLE_OPTIONS)
+        submitted = st.form_submit_button("ユーザーを追加")
+        if submitted:
+            if not username or not password:
+                st.error("ユーザー名とパスワードを入力してください。")
+            else:
+                try:
+                    execute("""
+                        INSERT INTO users(user_id, username, display_name, password_hash, role, is_active, created_at)
+                        VALUES(:user_id, :username, :display_name, :password_hash, :role, '1', :created_at)
+                    """, {
+                        "user_id": make_id("user"),
+                        "username": username,
+                        "display_name": display_name,
+                        "password_hash": hash_password(password),
+                        "role": role,
+                        "created_at": now_text(),
+                    })
+                    add_audit_log("create_user", "user", username, role)
+                    st.success("ユーザーを追加しました。")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"追加できませんでした：{e}")
+
+    st.markdown("### ユーザー一覧")
+    users = fetch_df("SELECT user_id, username, display_name, role, is_active, created_at FROM users ORDER BY created_at DESC")
+    st.dataframe(users, use_container_width=True)
+
+    st.markdown("### 権限変更・停止")
+    if not users.empty:
+        selected = st.selectbox("対象ユーザー", [f"{r['username']}｜{r['role']}｜{r['user_id']}" for _, r in users.iterrows()])
+        user_id = selected_id_from_label(selected)
+        u = fetch_one("SELECT * FROM users WHERE user_id=:user_id", {"user_id": user_id})
+        with st.form(f"edit_user_{user_id}"):
+            new_role = st.selectbox("権限", ROLE_OPTIONS, index=option_index(ROLE_OPTIONS, u.get("role", "閲覧者")))
+            active = st.selectbox("有効状態", ["1", "0"], index=0 if u.get("is_active", "1") == "1" else 1, format_func=lambda x: "有効" if x == "1" else "停止")
+            new_password = st.text_input("新パスワード（変更時のみ）", type="password")
+            submitted = st.form_submit_button("更新")
+            if submitted:
+                if new_password:
+                    execute("UPDATE users SET role=:role, is_active=:active, password_hash=:ph WHERE user_id=:user_id", {
+                        "role": new_role, "active": active, "ph": hash_password(new_password), "user_id": user_id
+                    })
+                else:
+                    execute("UPDATE users SET role=:role, is_active=:active WHERE user_id=:user_id", {
+                        "role": new_role, "active": active, "user_id": user_id
+                    })
+                add_audit_log("update_user", "user", user_id, f"{new_role}/{active}")
+                st.success("更新しました。")
+                st.rerun()
+
+    st.markdown("### 操作ログ")
+    logs = fetch_df("SELECT created_at, username, action, target_type, target_id, detail FROM audit_logs ORDER BY created_at DESC LIMIT 300")
+    st.dataframe(logs, use_container_width=True)
+
+
+def page_line_linkage():
+    st.subheader("📱 LINE連携")
+    st.caption("Ver2.1では、LINE送信用の設定・送信文作成・送信履歴保存まで対応します。実送信はチャネルアクセストークン設定後の運用を想定します。")
+
+    if not has_perm("line"):
+        st.warning("LINE連携は管理者または編集者のみ使用できます。")
+        return
+
+    st.markdown("### LINE設定")
+    setting = fetch_one("SELECT * FROM line_settings LIMIT 1")
+    with st.form("line_settings_form"):
+        token = st.text_input("チャネルアクセストークン", value=(setting or {}).get("channel_access_token", ""), type="password")
+        secret = st.text_input("チャネルシークレット", value=(setting or {}).get("channel_secret", ""), type="password")
+        default_to = st.text_input("送信先ID（userId/groupIdなど）", value=(setting or {}).get("default_to", ""))
+        enabled = st.selectbox("連携状態", ["0", "1"], index=1 if (setting or {}).get("enabled") == "1" else 0, format_func=lambda x: "有効" if x == "1" else "無効")
+        note = st.text_area("設定メモ", value=(setting or {}).get("note", ""))
+        submitted = st.form_submit_button("LINE設定を保存")
+        if submitted:
+            execute("DELETE FROM line_settings", {})
+            execute("""
+                INSERT INTO line_settings(setting_id, channel_access_token, channel_secret, default_to, enabled, note, updated_at)
+                VALUES(:setting_id, :token, :secret, :default_to, :enabled, :note, :updated_at)
+            """, {
+                "setting_id": "line_main",
+                "token": token,
+                "secret": secret,
+                "default_to": default_to,
+                "enabled": enabled,
+                "note": note,
+                "updated_at": now_text(),
+            })
+            add_audit_log("update_line_settings", "line", "line_main", "LINE設定更新")
+            st.success("LINE設定を保存しました。")
+            st.rerun()
+
+    st.markdown("### 案件別LINE文作成・履歴保存")
+    case_id = select_case_widget("line_case_select", include_closed=True)
+    if case_id:
+        c = get_case_full(case_id)
+        default_message = f"""【にゃんとも相談室】
+{c.get('name','')}様
+
+前回のご相談内容について、次回確認予定日が近づいています。
+次回確認予定日：{c.get('next_check_date','未設定')}
+
+確認したいこと：
+{c.get('next_check','')}
+
+※この連絡は、判断を急がせるものではなく、状況確認のためのものです。
+"""
+        with st.form(f"line_message_form_{case_id}"):
+            to_target = st.text_input("送信先ID", value=(setting or {}).get("default_to", "") if setting else "")
+            message_text = st.text_area("送信文", value=default_message, height=260)
+            save_only = st.form_submit_button("送信履歴として保存")
+            if save_only:
+                execute("""
+                    INSERT INTO line_messages(message_id, case_id, client_id, created_at, created_by,
+                                              to_target, message_text, send_status, response_memo)
+                    VALUES(:message_id, :case_id, :client_id, :created_at, :created_by,
+                           :to_target, :message_text, :send_status, :response_memo)
+                """, {
+                    "message_id": make_id("line"),
+                    "case_id": case_id,
+                    "client_id": c["client_id"],
+                    "created_at": now_text(),
+                    "created_by": (current_user() or {}).get("username", ""),
+                    "to_target": to_target,
+                    "message_text": message_text,
+                    "send_status": "下書き保存",
+                    "response_memo": "",
+                })
+                add_audit_log("save_line_draft", "case", case_id, "LINE下書き保存")
+                st.success("LINE送信文を履歴保存しました。")
+                st.rerun()
+
+    st.markdown("### LINE送信履歴")
+    df = fetch_df("""
+        SELECT lm.created_at, cl.name AS 相談者, c.case_title AS 案件名, lm.to_target, lm.send_status, lm.message_text, lm.response_memo, lm.message_id
+        FROM line_messages lm
+        LEFT JOIN cases c ON lm.case_id = c.case_id
+        LEFT JOIN clients cl ON lm.client_id = cl.client_id
+        ORDER BY lm.created_at DESC
+    """)
+    st.dataframe(df, use_container_width=True)
+
+
+def page_ai_history():
+    st.subheader("🧠 AI要約履歴")
+    df = fetch_df("""
+        SELECT a.created_at, cl.name AS 相談者, c.case_title AS 案件名, a.created_by, a.summary_type, a.ai_result, a.note, a.summary_id, a.case_id
+        FROM ai_summaries a
+        JOIN cases c ON a.case_id = c.case_id
+        JOIN clients cl ON a.client_id = cl.client_id
+        ORDER BY a.created_at DESC
+    """)
+    keyword = st.text_input("AI履歴検索", placeholder="相談者・案件・要約内容など")
+    if keyword and not df.empty:
+        df = df[df.astype(str).apply(lambda row: row.str.contains(keyword, case=False, na=False).any(), axis=1)]
+    st.dataframe(df, use_container_width=True)
+
+
 # -----------------------------
 # 起動
 # -----------------------------
 init_db()
-render_top_nav()
+ensure_default_admin()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.0（SQLite版）")
+if not current_user():
+    login_screen()
+    st.stop()
+
+render_top_nav()
+logout_button()
+
+st.title("🐾 にゃんとも相談管理システム Ver2.1（権限・AI履歴・LINE連携準備版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
@@ -1782,6 +2171,9 @@ tabs = st.tabs([
     "🤖 AI/PDF",
     "🔎 検索・更新・削除",
     "📦 データ管理",
+    "🔐 権限管理",
+    "📱 LINE連携",
+    "🧠 AI履歴",
 ])
 
 with tabs[0]:
@@ -1812,3 +2204,9 @@ with tabs[12]:
     page_search_update_delete()
 with tabs[13]:
     page_data_management()
+with tabs[14]:
+    page_user_management()
+with tabs[15]:
+    page_line_linkage()
+with tabs[16]:
+    page_ai_history()
