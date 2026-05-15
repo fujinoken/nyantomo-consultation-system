@@ -1072,8 +1072,8 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6（重複登録防止版）")
-st.caption("相談を保留のまま管理する現場OS｜案件起点・次アクション・入力不足チェック対応版")
+st.title("🐾 にゃんとも相談管理システム Ver1.6.1（重複登録防止・停止エラー修正版）")
+st.caption("相談を保留のまま管理する現場OS｜重複登録防止時も他タブが止まらない修正版")
 
 tabs = st.tabs([
     "🏡 案件ホーム",
@@ -1188,7 +1188,8 @@ with tabs[2]:
             internal_memo = st.text_area("内部メモ")
             next_check = st.text_area("次回確認すること")
 
-            submitted = st.form_submit_button("案件を登録")
+            duplicate_blocked = not duplicate_cases_preview.empty
+            submitted = st.form_submit_button("案件を登録", disabled=duplicate_blocked)
 
             if submitted:
                 duplicate_cases = find_duplicate_active_cases_by_client_name(data, client_id)
@@ -1198,50 +1199,49 @@ with tabs[2]:
                         duplicate_cases[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
                         use_container_width=True
                     )
-                    st.stop()
+                else:
+                    case_id = make_id("case")
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                case_id = make_id("case")
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    new_case = {
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "登録日時": now,
+                        "相談日": consult_date.strftime("%Y-%m-%d"),
+                        "案件名": case_title,
+                        "案件種別": case_type,
+                        "現在ステータス": status,
+                        "今いちばん近い状態": current_state,
+                        "住まいの状態": house_state,
+                        "猫との関係": cat_relation,
+                        "家族との温度差": family_gap,
+                        "急がされている感じ": pressure,
+                        "気になること": "、".join(worries),
+                        "今は決めたくないこと": not_decide,
+                        "まず確認したいこと": first_check,
+                        "自由メモ": free_memo,
+                        "内部メモ": internal_memo,
+                        "次回確認すること": next_check,
+                    }
 
-                new_case = {
-                    "case_id": case_id,
-                    "client_id": client_id,
-                    "登録日時": now,
-                    "相談日": consult_date.strftime("%Y-%m-%d"),
-                    "案件名": case_title,
-                    "案件種別": case_type,
-                    "現在ステータス": status,
-                    "今いちばん近い状態": current_state,
-                    "住まいの状態": house_state,
-                    "猫との関係": cat_relation,
-                    "家族との温度差": family_gap,
-                    "急がされている感じ": pressure,
-                    "気になること": "、".join(worries),
-                    "今は決めたくないこと": not_decide,
-                    "まず確認したいこと": first_check,
-                    "自由メモ": free_memo,
-                    "内部メモ": internal_memo,
-                    "次回確認すること": next_check,
-                }
+                    new_history = {
+                        "history_id": make_id("hist"),
+                        "case_id": case_id,
+                        "client_id": client_id,
+                        "記録日時": now,
+                        "記録日": consult_date.strftime("%Y-%m-%d"),
+                        "記録種別": "案件登録",
+                        "状態変更前": "",
+                        "状態変更後": status,
+                        "相談記録": free_memo,
+                        "次回アクション": next_check,
+                        "内部メモ": internal_memo,
+                    }
 
-                new_history = {
-                    "history_id": make_id("hist"),
-                    "case_id": case_id,
-                    "client_id": client_id,
-                    "記録日時": now,
-                    "記録日": consult_date.strftime("%Y-%m-%d"),
-                    "記録種別": "案件登録",
-                    "状態変更前": "",
-                    "状態変更後": status,
-                    "相談記録": free_memo,
-                    "次回アクション": next_check,
-                    "内部メモ": internal_memo,
-                }
-
-                data["cases"] = pd.concat([data["cases"], pd.DataFrame([new_case])], ignore_index=True)
-                data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
-                save_all(data)
-                st.success("案件を登録しました。")
+                    data["cases"] = pd.concat([data["cases"], pd.DataFrame([new_case])], ignore_index=True)
+                    data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
+                    save_all(data)
+                    st.success("案件を登録しました。")
 
     st.divider()
     st.dataframe(data["cases"], use_container_width=True)
