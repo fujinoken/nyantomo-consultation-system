@@ -15,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.7（安定運用版）
+# にゃんとも相談管理システム Ver1.7.1（バックアップ修正版）
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -513,6 +513,54 @@ def make_pdf_bytes(text):
     c.save()
     buffer.seek(0)
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------
+# Ver1.7.1 修正：バックアップZIP作成・復元関数
+# ---------------------------------------------------------
+def make_backup_zip_bytes():
+    """ExcelデータとphotosフォルダをZIP化して返す。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        if DATA_FILE.exists():
+            zf.write(DATA_FILE, arcname=DATA_FILE.name)
+        if PHOTO_DIR.exists():
+            for path in PHOTO_DIR.rglob("*"):
+                if path.is_file():
+                    zf.write(path, arcname=str(path))
+        # 復元時の目印用
+        zf.writestr("backup_info.txt", f"nyantomo backup created_at={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def restore_backup_zip(uploaded_file):
+    """バックアップZIPからExcelデータとphotosフォルダを復元する。"""
+    tmp_dir = Path("_restore_tmp")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(exist_ok=True)
+
+    with zipfile.ZipFile(uploaded_file, "r") as zf:
+        names = zf.namelist()
+        has_excel = DATA_FILE.name in names
+        if not has_excel:
+            raise ValueError("バックアップZIP内に nyantomo_consultation_data.xlsx が見つかりません。")
+
+        # zip slip 対策：想定ファイルだけ復元
+        for name in names:
+            normalized = name.replace("\\", "/")
+            if normalized == DATA_FILE.name:
+                target = DATA_FILE
+                target.write_bytes(zf.read(name))
+            elif normalized.startswith("photos/") and not normalized.endswith("/"):
+                rel = Path(normalized)
+                target = Path(rel)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(name))
+
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
 
 
 
@@ -1032,7 +1080,7 @@ def render_case_home(data):
     st.dataframe(view_df, use_container_width=True, hide_index=True)
 
     st.markdown("### 業務改善メモ")
-    st.info("Ver1.7では、今日やること・終了処理・バックアップ復元を追加し、日々の運用で止まりにくい安定版にしています。")
+    st.info("Ver1.7.1では、今日やること・終了処理・バックアップ復元を追加し、日々の運用で止まりにくい安定版にしています。")
 
     return data
 
@@ -1248,7 +1296,7 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.7（安定運用版）")
+st.title("🐾 にゃんとも相談管理システム Ver1.7.1.1（バックアップ修正版）")
 st.caption("相談を保留のまま管理する現場OS｜バックアップ・終了処理・今日やること対応版")
 
 # ---------------------------------------------------------
