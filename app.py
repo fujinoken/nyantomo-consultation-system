@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.2.3 LINE履歴表示強化版
+# にゃんとも相談管理システム Ver2.2.4 安定稼働版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -1320,6 +1320,225 @@ def export_all_to_excel_bytes():
     return buffer.getvalue()
 
 
+
+# -----------------------------
+# Ver2.2.4 安定稼働：インデックス・整合性チェック
+# -----------------------------
+def ensure_indexes():
+    """検索・関連データ取得を安定化するためのインデックスを作成する。"""
+    with get_conn() as conn:
+        conn.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_cases_client_id ON cases(client_id);
+        CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status);
+        CREATE INDEX IF NOT EXISTS idx_cases_next_check_date ON cases(next_check_date);
+        CREATE INDEX IF NOT EXISTS idx_cases_updated_at ON cases(updated_at);
+
+        CREATE INDEX IF NOT EXISTS idx_history_case_id ON history(case_id);
+        CREATE INDEX IF NOT EXISTS idx_history_client_id ON history(client_id);
+        CREATE INDEX IF NOT EXISTS idx_properties_case_id ON properties(case_id);
+        CREATE INDEX IF NOT EXISTS idx_properties_client_id ON properties(client_id);
+        CREATE INDEX IF NOT EXISTS idx_cats_case_id ON cats(case_id);
+        CREATE INDEX IF NOT EXISTS idx_cats_client_id ON cats(client_id);
+        CREATE INDEX IF NOT EXISTS idx_family_case_id ON family(case_id);
+        CREATE INDEX IF NOT EXISTS idx_family_client_id ON family(client_id);
+        CREATE INDEX IF NOT EXISTS idx_photos_case_id ON photos(case_id);
+        CREATE INDEX IF NOT EXISTS idx_photos_client_id ON photos(client_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_summaries_case_id ON ai_summaries(case_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_summaries_client_id ON ai_summaries(client_id);
+        CREATE INDEX IF NOT EXISTS idx_line_messages_case_id ON line_messages(case_id);
+        CREATE INDEX IF NOT EXISTS idx_line_messages_client_id ON line_messages(client_id);
+        """)
+        conn.commit()
+
+
+RELATED_TABLES = [
+    ("history", "history_id"),
+    ("properties", "property_id"),
+    ("cats", "cat_id"),
+    ("family", "family_id"),
+    ("photos", "photo_id"),
+    ("ai_summaries", "summary_id"),
+    ("line_messages", "message_id"),
+]
+
+
+def relation_check_df():
+    """case_id / client_id のズレ、孤立データ、写真ファイル欠損を一覧化する。"""
+    rows = []
+
+    for table, id_col in RELATED_TABLES:
+        # case_id が存在しない孤立データ
+        orphan_case = fetch_df(f"""
+            SELECT r.{id_col} AS record_id, r.case_id, r.client_id
+            FROM {table} r
+            LEFT JOIN cases c ON r.case_id = c.case_id
+            WHERE r.case_id IS NOT NULL
+              AND r.case_id != ''
+              AND c.case_id IS NULL
+        """)
+        for _, r in orphan_case.iterrows():
+            rows.append({
+                "種別": "孤立データ",
+                "テーブル": table,
+                "ID": r.get("record_id", ""),
+                "case_id": r.get("case_id", ""),
+                "client_id": r.get("client_id", ""),
+                "内容": "親案件が存在しません",
+                "自動修復": "不可：削除または案件復元が必要",
+            })
+
+        # case_id の親案件 client_id と子データ client_id の不一致
+        mismatch = fetch_df(f"""
+            SELECT r.{id_col} AS record_id, r.case_id, r.client_id AS child_client_id, c.client_id AS parent_client_id
+            FROM {table} r
+            JOIN cases c ON r.case_id = c.case_id
+            WHERE COALESCE(r.client_id, '') != COALESCE(c.client_id, '')
+        """)
+        for _, r in mismatch.iterrows():
+            rows.append({
+                "種別": "client_id不一致",
+                "テーブル": table,
+                "ID": r.get("record_id", ""),
+                "case_id": r.get("case_id", ""),
+                "client_id": r.get("child_client_id", ""),
+                "内容": f"親案件のclient_id={r.get('parent_client_id', '')} と不一致",
+                "自動修復": "可：親案件のclient_idに合わせる",
+            })
+
+    # 写真DBにあるがファイルがない
+    try:
+        photos = fetch_df("SELECT photo_id, case_id, client_id, saved_path FROM photos")
+        for _, p in photos.iterrows():
+            sp = str(p.get("saved_path", ""))
+            if sp and not Path(sp).exists():
+                rows.append({
+                    "種別": "写真ファイル欠損",
+                    "テーブル": "photos",
+                    "ID": p.get("photo_id", ""),
+                    "case_id": p.get("case_id", ""),
+                    "client_id": p.get("client_id", ""),
+                    "内容": f"保存先ファイルが見つかりません：{sp}",
+                    "自動修復": "不可：再アップロードまたは写真データ削除",
+                })
+    except Exception:
+        pass
+
+    return pd.DataFrame(rows)
+
+
+def repair_client_id_mismatches():
+    """子テーブルのclient_idを親案件のclient_idへ揃える。"""
+    total = 0
+    with get_conn() as conn:
+        for table, id_col in RELATED_TABLES:
+            cur = conn.execute(f"""
+                UPDATE {table}
+                SET client_id = (
+                    SELECT cases.client_id
+                    FROM cases
+                    WHERE cases.case_id = {table}.case_id
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM cases
+                    WHERE cases.case_id = {table}.case_id
+                      AND COALESCE(cases.client_id, '') != COALESCE({table}.client_id, '')
+                )
+            """)
+            total += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    add_audit_log("repair_relations", "database", "client_id_mismatch", f"fixed={total}")
+    return total
+
+
+def delete_orphan_related_records():
+    """親案件がない孤立データを削除する。通常は使わないが、復元失敗時の整理用。"""
+    total = 0
+    with get_conn() as conn:
+        for table, id_col in RELATED_TABLES:
+            cur = conn.execute(f"""
+                DELETE FROM {table}
+                WHERE case_id IS NOT NULL
+                  AND case_id != ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cases WHERE cases.case_id = {table}.case_id
+                  )
+            """)
+            total += cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+    add_audit_log("delete_orphans", "database", "orphan_related_records", f"deleted={total}")
+    return total
+
+
+def delete_photo_files_for_case(case_id):
+    """案件削除前に紐づく写真ファイルを削除する。"""
+    removed = 0
+    try:
+        df = fetch_df("SELECT saved_path FROM photos WHERE case_id=:case_id", {"case_id": case_id})
+        for _, row in df.iterrows():
+            path = Path(str(row.get("saved_path", "")))
+            if path.exists() and path.is_file():
+                try:
+                    path.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
+def delete_photo_file_by_id(photo_id):
+    """写真データ削除前に実ファイルを削除する。"""
+    removed = 0
+    try:
+        row = fetch_one("SELECT saved_path FROM photos WHERE photo_id=:photo_id", {"photo_id": photo_id})
+        if row:
+            path = Path(str(row.get("saved_path", "")))
+            if path.exists() and path.is_file():
+                try:
+                    path.unlink()
+                    removed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
+def touch_case(case_id):
+    """子データ更新時に親案件の最終更新日を更新する。"""
+    if case_id:
+        execute("UPDATE cases SET updated_at=:updated_at WHERE case_id=:case_id", {
+            "updated_at": now_text(),
+            "case_id": case_id,
+        })
+
+
+def safe_restore_backup_zip(uploaded_file):
+    """
+    復元前に現行DBを退避し、復元後にDB初期化・インデックス作成を行う。
+    """
+    safety_dir = Path("_safety_backup_before_restore")
+    safety_dir.mkdir(exist_ok=True)
+    if DB_FILE.exists():
+        shutil.copy2(DB_FILE, safety_dir / f"{DB_FILE.stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db")
+
+    # 既存photosを一度退避。復元ZIPにphotosがある場合は上書き整理。
+    if PHOTO_DIR.exists():
+        backup_photo_dir = safety_dir / f"photos_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        try:
+            shutil.copytree(PHOTO_DIR, backup_photo_dir, dirs_exist_ok=True)
+        except Exception:
+            pass
+
+    restored = restore_backup_zip(uploaded_file)
+    init_db()
+    ensure_indexes()
+    add_audit_log("restore_backup", "database", "backup_zip", ",".join(restored))
+    return restored
+
+
 # -----------------------------
 # UI補助
 # -----------------------------
@@ -2239,7 +2458,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.2.3では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.2.4では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -2520,8 +2739,7 @@ def page_data_management():
     st.warning("復元すると現在のSQLite DBが上書きされます。復元前に必ずバックアップしてください。")
     restore_file = st.file_uploader("Ver2.0バックアップZIPをアップロードして復元", type=["zip"], key="restore_zip")
     if restore_file and st.button("バックアップから復元する"):
-        restored = restore_backup_zip(restore_file)
-        init_db()
+        restored = safe_restore_backup_zip(restore_file)
         st.success(f"復元しました：{', '.join(restored)}")
         st.rerun()
 
@@ -2714,10 +2932,58 @@ def page_ai_history():
     st.dataframe(df, use_container_width=True)
 
 
+
+def page_relation_maintenance():
+    st.subheader("🧰 リレーション整合性")
+    st.caption("case_id・client_idの不一致、孤立データ、写真ファイル欠損を確認します。")
+
+    ensure_indexes()
+
+    check_df = relation_check_df()
+    if check_df.empty:
+        st.success("リレーションの大きな問題は見つかりません。")
+    else:
+        st.warning(f"確認が必要な項目が {len(check_df)} 件あります。")
+        st.dataframe(check_df, use_container_width=True)
+
+    st.markdown("### 自動修復")
+    st.caption("client_id不一致のみ、親案件のclient_idに揃えて自動修復できます。孤立データや写真欠損は内容確認が必要です。")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("client_id不一致を自動修復", disabled=not has_perm("admin")):
+            fixed = repair_client_id_mismatches()
+            st.success(f"{fixed}件を修復しました。")
+            st.rerun()
+
+    with c2:
+        st.warning("孤立データ削除は復元ミス時のみ使用してください。")
+        confirm = st.checkbox("孤立データ削除を許可する", key="confirm_delete_orphans")
+        if st.button("親案件のない孤立データを削除", disabled=(not confirm or not has_perm("admin"))):
+            deleted = delete_orphan_related_records()
+            st.success(f"{deleted}件の孤立データを削除しました。")
+            st.rerun()
+
+    st.markdown("### 件数確認")
+    counts = pd.DataFrame([
+        {"テーブル": "clients", "件数": table_count("clients")},
+        {"テーブル": "cases", "件数": table_count("cases")},
+        {"テーブル": "history", "件数": table_count("history")},
+        {"テーブル": "properties", "件数": table_count("properties")},
+        {"テーブル": "cats", "件数": table_count("cats")},
+        {"テーブル": "family", "件数": table_count("family")},
+        {"テーブル": "photos", "件数": table_count("photos")},
+        {"テーブル": "ai_summaries", "件数": table_count("ai_summaries")},
+        {"テーブル": "line_messages", "件数": table_count("line_messages")},
+    ])
+    st.dataframe(counts, use_container_width=True)
+
+
 # -----------------------------
 # 起動
 # -----------------------------
 init_db()
+ensure_indexes()
 ensure_default_admin()
 
 if not current_user():
@@ -2727,7 +2993,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.2.3（LINE履歴表示強化版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.2.4（安定稼働版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
@@ -2754,6 +3020,7 @@ tabs = st.tabs([
     "🤖 AI助言/PDF",
     "🔎 検索・更新・削除",
     "📦 データ管理",
+    "🧰 リレーション整合性",
     "🔐 権限管理",
     "📱 LINE連携",
     "🧠 AI履歴",
@@ -2788,8 +3055,10 @@ with tabs[12]:
 with tabs[13]:
     page_data_management()
 with tabs[14]:
-    page_user_management()
+    page_relation_maintenance()
 with tabs[15]:
-    page_line_linkage()
+    page_user_management()
 with tabs[16]:
+    page_line_linkage()
+with tabs[17]:
     page_ai_history()
