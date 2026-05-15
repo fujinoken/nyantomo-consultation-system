@@ -4,6 +4,8 @@ from datetime import date, datetime
 from pathlib import Path
 import uuid
 import io
+import zipfile
+import shutil
 from urllib.parse import quote_plus
 
 from reportlab.pdfgen import canvas
@@ -13,7 +15,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.6（案件選択改善版）
+# にゃんとも相談管理システム Ver1.7（安定運用版）
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -45,7 +47,8 @@ CLIENT_COLUMNS = [
 CASE_COLUMNS = [
     "case_id", "client_id", "登録日時", "相談日", "案件名", "案件種別", "現在ステータス",
     "今いちばん近い状態", "住まいの状態", "猫との関係", "家族との温度差", "急がされている感じ",
-    "気になること", "今は決めたくないこと", "まず確認したいこと", "自由メモ", "内部メモ", "次回確認すること"
+    "気になること", "今は決めたくないこと", "まず確認したいこと", "自由メモ", "内部メモ",
+    "次回確認すること", "次回確認日", "終了日", "終了理由", "最終メモ", "再相談可能性"
 ]
 
 HISTORY_COLUMNS = [
@@ -104,6 +107,8 @@ CHOICE_OPTIONS = {
     "連絡可否": ["未確認", "連絡可", "連絡不可", "本人経由のみ"],
     "温度感": ["未確認", "協力的", "中立", "慎重", "反対気味", "不明"],
     "写真種別": ["外観", "室内", "郵便受け", "庭", "猫", "書類", "その他"],
+    "終了理由": ["未選択", "相談終了", "見守り終了", "他専門家へ引継ぎ", "本人・家族判断で終了", "連絡途絶により終了", "その他"],
+    "再相談可能性": ["未選択", "あり", "可能性あり", "低い", "なし"],
 }
 
 WORRY_OPTIONS = [
@@ -130,7 +135,7 @@ def render_crud_edit_input(table_key, col, value):
     key = f"crud_edit_{table_key}_{col}"
     value = str(value or "")
 
-    if col in ["相談日", "記録日"]:
+    if col in ["相談日", "記録日", "次回確認日", "終了日"]:
         selected_date = st.date_input(col, value=parse_date_for_input(value), key=key)
         return selected_date.strftime("%Y-%m-%d")
 
@@ -406,6 +411,15 @@ def build_case_memo(data, case_id):
 
 ■ 次回確認すること
 {case_row['次回確認すること']}
+
+■ 次回確認日
+{case_row.get('次回確認日', '')}
+
+■ 終了情報
+終了日：{case_row.get('終了日', '')}
+終了理由：{case_row.get('終了理由', '')}
+再相談可能性：{case_row.get('再相談可能性', '')}
+最終メモ：{case_row.get('最終メモ', '')}
 
 ※このメモは、判断を急がせず、状況を整理するための内部記録です。
 ※法的判断・医療判断・不動産判断を断定するものではありません。
@@ -866,8 +880,31 @@ def build_case_home_dataframe(data):
             missing.append("家族メモ")
 
         status = c.get("現在ステータス", "")
+        due_date = parse_date_safe(c.get("次回確認日", ""))
+        if status == "終了":
+            due_label = "終了済"
+            due_days = ""
+        elif due_date:
+            diff = (due_date - today).days
+            due_days = diff
+            if diff < 0:
+                due_label = "期限超過"
+            elif diff == 0:
+                due_label = "今日"
+            elif diff <= 7:
+                due_label = "7日以内"
+            else:
+                due_label = "予定あり"
+        else:
+            due_label = "日付未設定"
+            due_days = ""
+
         if status == "終了":
             next_action_label = "終了済"
+        elif due_date and due_days != "" and due_days <= 0:
+            next_action_label = "今日確認" if due_days == 0 else "期限超過"
+        elif due_date and due_days != "" and due_days <= 7:
+            next_action_label = "7日以内に確認"
         elif days is None:
             next_action_label = "まず初回記録を確認"
         elif days >= 90:
@@ -883,6 +920,12 @@ def build_case_home_dataframe(data):
 
         if status == "終了":
             priority = "完了"
+        elif due_date and due_days != "" and due_days < 0:
+            priority = "高"
+        elif due_date and due_days != "" and due_days == 0:
+            priority = "高"
+        elif due_date and due_days != "" and due_days <= 7:
+            priority = "中"
         elif days is not None and days >= 90:
             priority = "高"
         elif days is not None and days >= 60:
@@ -903,7 +946,13 @@ def build_case_home_dataframe(data):
             "未更新日数": days if days is not None else "",
             "静かな確認": case_silent_status(days),
             "入力不足": "、".join(missing),
+            "次回確認日": c.get("次回確認日", ""),
+            "期限状態": due_label,
+            "期限まで": due_days,
             "次回確認すること": c.get("次回確認すること", ""),
+            "終了日": c.get("終了日", ""),
+            "終了理由": c.get("終了理由", ""),
+            "再相談可能性": c.get("再相談可能性", ""),
             "履歴数": history_count,
             "空き家": prop_count,
             "猫": cat_count,
@@ -914,8 +963,8 @@ def build_case_home_dataframe(data):
 
 
 def render_case_home(data):
-    st.subheader("🏡 案件ホーム Ver1.6")
-    st.caption("今日見るべき案件、止まっている案件、入力が足りない案件を一画面で確認します。")
+    st.subheader("🏡 案件ホーム Ver1.7")
+    st.caption("今日やること・期限切れ・入力不足・止まっている案件を一画面で確認します。")
 
     if data["cases"].empty:
         st.info("まだ案件がありません。先に相談者登録・案件登録をしてください。")
@@ -926,7 +975,10 @@ def render_case_home(data):
     active_df = home_df[home_df["現在ステータス"] != "終了"]
     high_df = active_df[active_df["優先"].isin(["高", "中"])]
     missing_df = active_df[active_df["入力不足"].astype(str).str.len() > 0]
-    next_df = active_df[active_df["次アクション"].isin(["次回確認あり", "静かに確認", "近況確認の候補", "継続要否を確認", "まず初回記録を確認"])]
+    next_df = active_df[
+        active_df["次アクション"].isin(["期限超過", "今日確認", "7日以内に確認", "次回確認あり", "静かに確認", "近況確認の候補", "継続要否を確認", "まず初回記録を確認"])
+        | active_df["期限状態"].isin(["期限超過", "今日", "7日以内"])
+    ]
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("全案件", len(home_df))
@@ -940,7 +992,7 @@ def render_case_home(data):
         st.success("今日すぐ確認すべき案件はありません。")
     else:
         st.dataframe(
-            next_df[["優先", "次アクション", "案件名", "相談者", "現在ステータス", "未更新日数", "入力不足", "次回確認すること", "case_id"]],
+            next_df[["優先", "次アクション", "案件名", "相談者", "現在ステータス", "次回確認日", "期限状態", "期限まで", "未更新日数", "入力不足", "次回確認すること", "case_id"]],
             use_container_width=True,
             hide_index=True,
         )
@@ -980,7 +1032,7 @@ def render_case_home(data):
     st.dataframe(view_df, use_container_width=True, hide_index=True)
 
     st.markdown("### 業務改善メモ")
-    st.info("Ver1.6では、案件を“探す”時間を減らし、今日見る案件・入力不足・止まっている案件を先に出す設計にしています。")
+    st.info("Ver1.7では、今日やること・終了処理・バックアップ復元を追加し、日々の運用で止まりにくい安定版にしています。")
 
     return data
 
@@ -1057,6 +1109,10 @@ def render_case_dashboard(data):
             st.write(f"**家族との温度差：** {case_row.get('家族との温度差','')}")
             st.write(f"**急がされている感じ：** {case_row.get('急がされている感じ','')}")
             st.write(f"**次回確認すること：** {case_row.get('次回確認すること','')}")
+            st.write(f"**次回確認日：** {case_row.get('次回確認日','')}")
+            if case_row.get('現在ステータス','') == '終了':
+                st.write(f"**終了日：** {case_row.get('終了日','')}")
+                st.write(f"**終了理由：** {case_row.get('終了理由','')}")
 
     st.markdown("### 状態を進める")
     with st.form(f"casehub_status_form_{case_id}"):
@@ -1071,8 +1127,17 @@ def render_case_dashboard(data):
         with c2:
             record_type = st.selectbox("記録種別", ["状態変更", "相談", "電話", "LINE", "メール", "面談", "現地確認", "終了確認", "その他"], key=f"casehub_record_type_{case_id}")
             next_action = st.text_area("次回アクション", key=f"casehub_next_action_{case_id}")
+        next_due_date = st.date_input("次回確認日（未定の場合は今日のまま。登録時に空欄扱いへ戻せます）", value=parse_date_safe(case_row.get("次回確認日", "")) or date.today(), key=f"casehub_next_due_{case_id}")
+        use_next_due = st.checkbox("次回確認日を設定する", value=bool(str(case_row.get("次回確認日", "")).strip()), key=f"casehub_use_next_due_{case_id}")
         record = st.text_area("相談記録・判断保留の理由・確認した事実", key=f"casehub_record_{case_id}")
         internal = st.text_area("内部メモ", key=f"casehub_internal_{case_id}")
+
+        st.markdown("#### 終了処理（新しいステータスを『終了』にする場合）")
+        end_date = st.date_input("終了日", value=date.today(), key=f"casehub_end_date_{case_id}")
+        end_reason = st.selectbox("終了理由", CHOICE_OPTIONS["終了理由"], key=f"casehub_end_reason_{case_id}")
+        reopen_possibility = st.selectbox("再相談可能性", CHOICE_OPTIONS["再相談可能性"], key=f"casehub_reopen_{case_id}")
+        final_memo = st.text_area("最終メモ", key=f"casehub_final_memo_{case_id}")
+
         submitted = st.form_submit_button("履歴を追加してステータス更新")
         if submitted:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1092,6 +1157,12 @@ def render_case_dashboard(data):
             data["history"] = pd.concat([data["history"], pd.DataFrame([new_history])], ignore_index=True)
             data["cases"].loc[data["cases"]["case_id"] == case_id, "現在ステータス"] = new_status
             data["cases"].loc[data["cases"]["case_id"] == case_id, "次回確認すること"] = next_action
+            data["cases"].loc[data["cases"]["case_id"] == case_id, "次回確認日"] = next_due_date.strftime("%Y-%m-%d") if use_next_due and new_status != "終了" else ""
+            if new_status == "終了":
+                data["cases"].loc[data["cases"]["case_id"] == case_id, "終了日"] = end_date.strftime("%Y-%m-%d")
+                data["cases"].loc[data["cases"]["case_id"] == case_id, "終了理由"] = end_reason
+                data["cases"].loc[data["cases"]["case_id"] == case_id, "再相談可能性"] = reopen_possibility
+                data["cases"].loc[data["cases"]["case_id"] == case_id, "最終メモ"] = final_memo
             save_all(data)
             st.success("履歴を追加し、案件ステータスを更新しました。")
             st.rerun()
@@ -1177,8 +1248,8 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6.5（二行メニュー対応版）")
-st.caption("相談を保留のまま管理する現場OS｜メニュー二行表示・視認性改善版")
+st.title("🐾 にゃんとも相談管理システム Ver1.7（安定運用版）")
+st.caption("相談を保留のまま管理する現場OS｜バックアップ・終了処理・今日やること対応版")
 
 # ---------------------------------------------------------
 # Ver1.6.5 追加：メニュー二行表示・視認性改善
@@ -1391,6 +1462,11 @@ with tabs[2]:
                         "自由メモ": free_memo,
                         "内部メモ": internal_memo,
                         "次回確認すること": next_check,
+                        "次回確認日": next_due_date.strftime("%Y-%m-%d") if set_next_due else "",
+                        "終了日": "",
+                        "終了理由": "",
+                        "最終メモ": "",
+                        "再相談可能性": "",
                     }
 
                     new_history = {
@@ -1759,16 +1835,38 @@ with tabs[13]:
 
 
 with tabs[14]:
-    st.subheader("データ管理")
+    st.subheader("データ管理・バックアップ")
+
+    st.markdown("### バックアップ")
+    st.caption("ExcelデータとphotosフォルダをまとめてZIPで保存します。運用前後に必ずダウンロードしてください。")
+    backup_bytes = make_backup_zip_bytes()
+    st.download_button(
+        "バックアップZIPをダウンロード",
+        data=backup_bytes,
+        file_name=f"nyantomo_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+        mime="application/zip",
+    )
 
     if DATA_FILE.exists():
         with open(DATA_FILE, "rb") as f:
             st.download_button(
-                "Excelデータをダウンロード",
+                "Excelデータだけをダウンロード",
                 data=f,
                 file_name="nyantomo_consultation_data.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
+    st.markdown("### 復元")
+    st.warning("復元すると現在のExcelデータがバックアップ内容で置き換わります。実行前に必ずバックアップZIPを保存してください。")
+    restore_file = st.file_uploader("復元するバックアップZIP", type=["zip"], key="restore_backup_zip")
+    confirm_restore = st.checkbox("現在のデータを置き換えて復元します", key="confirm_restore_backup")
+    if st.button("バックアップから復元", disabled=not (restore_file and confirm_restore), type="primary"):
+        try:
+            restore_backup_zip(restore_file)
+            st.success("復元しました。画面を再読み込みします。")
+            st.rerun()
+        except Exception as e:
+            st.error(f"復元できませんでした：{e}")
 
     st.markdown("### 全データ一覧")
     for label, cfg in TABLE_CONFIG.items():
