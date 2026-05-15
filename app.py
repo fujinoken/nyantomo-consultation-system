@@ -13,7 +13,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver1.6
+# にゃんとも相談管理システム Ver1.6（案件選択改善版）
 # ---------------------------------------------------------
 # 追加機能：
 # ・PDF出力
@@ -122,7 +122,32 @@ def get_client_label(row):
 
 
 def get_case_label(row):
-    return f"{row.get('案件名','')}｜{row.get('現在ステータス','')}｜{row.get('case_id','')}"
+    """案件選択用ラベル。
+    視認性を上げるため、相談者名を先頭に表示する。
+    selected_id_from_label() が使えるよう、case_id は必ず最後に置く。
+    """
+    client_id = str(row.get("client_id", ""))
+    client_name = "相談者未登録"
+
+    try:
+        clients_df = data.get("clients", pd.DataFrame())
+        if not clients_df.empty and "client_id" in clients_df.columns:
+            matched = clients_df[clients_df["client_id"] == client_id]
+            if not matched.empty:
+                name = str(matched.iloc[0].get("お名前", "")).strip()
+                if name:
+                    client_name = name
+    except Exception:
+        pass
+
+    consult_date = str(row.get("相談日", "")).strip()
+    case_title = str(row.get("案件名", "")).strip() or "案件名未入力"
+    status = str(row.get("現在ステータス", "")).strip() or "ステータス未設定"
+    case_id = str(row.get("case_id", "")).strip()
+
+    if consult_date:
+        return f"{client_name}｜{case_title}｜{status}｜{consult_date}｜{case_id}"
+    return f"{client_name}｜{case_title}｜{status}｜{case_id}"
 
 
 def selected_id_from_label(label):
@@ -1006,7 +1031,7 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6")
+st.title("🐾 にゃんとも相談管理システム Ver1.6（案件選択改善版）")
 st.caption("相談を保留のまま管理する現場OS｜案件起点・次アクション・入力不足チェック対応版")
 
 tabs = st.tabs([
