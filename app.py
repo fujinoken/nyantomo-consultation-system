@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.1 権限・AI履歴・LINE連携準備版
+# にゃんとも相談管理システム Ver2.2 AI対応アドバイス版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -467,7 +467,7 @@ def init_db():
         # 将来追加分に備えた軽いマイグレーション
         for col in ["next_check_date", "closed_date", "close_reason", "final_memo", "reopen_possibility", "updated_at"]:
             add_column_if_missing(conn, "cases", col)
-        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.1')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('app_version', '2.2')")
         conn.commit()
 
 
@@ -1111,7 +1111,7 @@ def make_backup_zip_bytes():
                     z.write(path, path.as_posix())
         meta = {
             "app": "nyantomo-consultation-system",
-            "version": "2.1",
+            "version": "2.2",
             "created_at": now_text(),
             "files": [DB_FILE.name, "photos/"]
         }
@@ -1456,7 +1456,7 @@ def page_case_dashboard():
 
     st.divider()
     st.markdown("### この案件に紐づくデータ")
-    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "AI/PDF用メモ"])
+    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "AI/PDF用メモ", "管理者アドバイス"])
 
     with rel_tabs[0]:
         st.dataframe(fetch_df("SELECT * FROM clients WHERE client_id=:client_id", {"client_id": c["client_id"]}), use_container_width=True)
@@ -1493,6 +1493,11 @@ def page_case_dashboard():
         memo = build_case_memo(case_id)
         st.text_area("案件統合メモ", memo, height=500)
         st.download_button("この案件のPDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_case_{case_id}.pdf", mime="application/pdf")
+
+    with rel_tabs[7]:
+        advice = build_management_advice(case_id)
+        st.text_area("管理者向け対応アドバイス案", advice, height=500)
+        st.download_button("対応アドバイスPDFをダウンロード", make_pdf_bytes(advice), file_name=f"nyantomo_advice_{case_id}.pdf", mime="application/pdf")
 
 
 def page_history():
@@ -1752,65 +1757,287 @@ def page_photos():
                 st.image(str(path), width=350)
 
 
+
+def build_management_advice(case_id):
+    """
+    案件ごとの現時点情報から、管理者向けの対応アドバイス案を作成する。
+    注意：これは判断代行ではなく、事実・未確定・保留・次回確認を整理する補助出力。
+    """
+    c = get_case_full(case_id)
+    if not c:
+        return ""
+
+    history_df = get_related_df("history", case_id)
+    prop_df = get_related_df("properties", case_id)
+    cat_df = get_related_df("cats", case_id)
+    fam_df = get_related_df("family", case_id)
+    photo_df = get_related_df("photos", case_id)
+
+    status = c.get("status", "")
+    pressure = c.get("pressure", "")
+    family_gap = c.get("family_gap", "")
+    house_state = c.get("house_state", "")
+    cat_relation = c.get("cat_relation", "")
+    worries = c.get("worries", "")
+    next_date = c.get("next_check_date", "")
+    last_update_days = get_last_update_days(c.get("updated_at", ""))
+
+    # リスク・確認ポイントを軽く判定
+    attention = []
+    if pressure in ["強くある", "自分でも焦っている"]:
+        attention.append("相談者が急がされている／焦っている可能性があるため、結論よりも状況整理を優先する。")
+    if family_gap in ["かなりある", "まだ話せていない"]:
+        attention.append("家族間の温度差があるため、対立構造にせず、事実と気持ちを分けて確認する。")
+    if house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"]:
+        attention.append("住まいが空白状態に近いため、売却・賃貸判断ではなく、まず管理・安全確認の必要性を整理する。")
+    if cat_relation in ["猫を残して入院・施設入所が心配", "猫と暮らしている", "家族の猫がいる"]:
+        attention.append("猫の生活継続が判断に影響するため、人・住まい・猫を分けずに確認する。")
+    if last_update_days is not None and last_update_days >= 60:
+        attention.append(f"最終更新から{last_update_days}日経過しているため、急かさない形で状況確認を入れる。")
+    if not next_date:
+        attention.append("次回確認日が未設定のため、保留と放置を分けるために確認日を設定する。")
+
+    if not attention:
+        attention.append("現時点で強い注意点は少ないが、未確定事項を分けて静かに整理する。")
+
+    # 不足情報
+    missing = []
+    missing_map = {
+        "current_state": "相談者が今どの段階にいるか",
+        "house_state": "住まいの状態",
+        "cat_relation": "猫との関係",
+        "family_gap": "家族との温度差",
+        "pressure": "急がされている感じ",
+        "worries": "気になること",
+        "next_check_date": "次回確認日",
+    }
+    for key, label in missing_map.items():
+        v = c.get(key, "")
+        if not v or v == "未選択":
+            missing.append(label)
+
+    # 次回の具体案
+    next_actions = []
+    if "空き家管理" in worries or house_state in ["空き家になっている", "近いうちに空き家になりそう", "相続後そのまま"]:
+        next_actions.append("住まいについて、現在の管理状況・鍵の所在・郵便物・近隣不安の有無を確認する。")
+    if "猫" in cat_relation or "猫" in worries or not cat_df.empty:
+        next_actions.append("猫について、現在の世話の体制・緊急時の預け先候補・本人の希望を確認する。")
+    if family_gap in ["少しある", "かなりある", "まだ話せていない"]:
+        next_actions.append("家族について、誰が急いでいるのか／誰が迷っているのかを、責めずに分けて聞く。")
+    if not next_actions:
+        next_actions.append("次回は、相談者が『今は決めたくないこと』と『確認だけならできること』を分けて聞く。")
+
+    # 管理者向け声かけ案
+    talk = []
+    talk.append("「今日すぐに決めなくて大丈夫です。まず、今わかっていることと、まだ決めなくてよいことを分けてみましょう。」")
+    if pressure in ["少しある", "強くある", "自分でも焦っている"]:
+        talk.append("「急いだ方がよい話と、急がなくてもよい話が混ざっているかもしれません。一度、分けて確認しましょう。」")
+    if family_gap in ["少しある", "かなりある", "まだ話せていない"]:
+        talk.append("「ご家族の意見も大切ですが、まずはご本人が何に困っているかを確認してから進めましょう。」")
+    if "猫" in cat_relation or "猫" in worries:
+        talk.append("「猫の暮らしも含めて考えると、住まいの正解は少し変わることがあります。」")
+
+    # やらないこと
+    avoid = [
+        "売却・賃貸・施設入所などの結論をこちらから急がせない。",
+        "家族間の温度差を対立として扱わない。",
+        "法的判断・医療判断・不動産判断を断定しない。",
+        "AI出力をそのまま相談者に渡さず、管理者が確認してから使う。",
+    ]
+
+    history_text = "未登録" if history_df.empty else "\n".join([
+        f"- {r.get('record_date','')}｜{r.get('record_type','')}｜{r.get('before_status','')}→{r.get('after_status','')}｜{str(r.get('record',''))[:80]}"
+        for _, r in history_df.head(5).iterrows()
+    ])
+
+    advice = f"""【管理者向け：にゃんとも対応アドバイス案】
+
+作成日：{today_text()}
+対象案件：{c.get('case_title','')}
+相談者：{c.get('name','')}（{c.get('area','')}）
+現在ステータス：{status}
+次回確認日：{next_date or '未設定'}
+
+━━━━━━━━━━━━━━━━━━━━
+1. 現時点の見立て
+━━━━━━━━━━━━━━━━━━━━
+この案件は、現時点では「{status}」の段階です。
+相談者の状態は「{c.get('current_state','')}」、住まいは「{house_state}」、猫との関係は「{cat_relation}」として記録されています。
+
+この段階では、結論を出すことよりも、
+「何が事実で、何が未確定で、何を保留してよいか」を分けることが重要です。
+
+━━━━━━━━━━━━━━━━━━━━
+2. 管理者が注意して見る点
+━━━━━━━━━━━━━━━━━━━━
+{chr(10).join([f"・{x}" for x in attention])}
+
+━━━━━━━━━━━━━━━━━━━━
+3. まだ確認した方がよい不足情報
+━━━━━━━━━━━━━━━━━━━━
+{chr(10).join([f"・{x}" for x in missing]) if missing else "・大きな不足項目は少ないです。ただし、相談者の気持ちの変化は次回も確認してください。"}
+
+━━━━━━━━━━━━━━━━━━━━
+4. 次回対応の具体案
+━━━━━━━━━━━━━━━━━━━━
+{chr(10).join([f"・{x}" for x in next_actions])}
+
+━━━━━━━━━━━━━━━━━━━━
+5. 相談者への声かけ案
+━━━━━━━━━━━━━━━━━━━━
+{chr(10).join([f"・{x}" for x in talk])}
+
+━━━━━━━━━━━━━━━━━━━━
+6. 今回あえてやらないこと
+━━━━━━━━━━━━━━━━━━━━
+{chr(10).join([f"・{x}" for x in avoid])}
+
+━━━━━━━━━━━━━━━━━━━━
+7. 最近の履歴
+━━━━━━━━━━━━━━━━━━━━
+{history_text}
+
+━━━━━━━━━━━━━━━━━━━━
+8. 管理者メモ
+━━━━━━━━━━━━━━━━━━━━
+この出力は、相談者への対応を決めるための補助メモです。
+最終判断は管理者が行い、相談者に結論を急がせない前提で使用してください。
+"""
+    return advice
+
+
+def build_management_advice_prompt(case_id):
+    memo = build_case_memo(case_id)
+    return f"""あなたは、にゃんとも相談管理システムの管理者補助AIです。
+以下の案件情報をもとに、管理者が相談者へどう対応するかの「対応アドバイス案」を作成してください。
+
+【にゃんとも事業の前提】
+・解決を急がせない。
+・売らない、急がせない、決めさせない。
+・相談者の判断を奪わない。
+・保留と放置を分ける。
+・人、住まい、猫、家族の温度差を分断せずに扱う。
+・結論ではなく、次に確認することを整理する。
+・法的判断、医療判断、不動産判断を断定しない。
+・家族間の対立を煽らない。
+・相談者にそのまま渡す文章ではなく、管理者向けの内部助言として書く。
+
+【出力形式】
+1. 現時点の見立て
+2. 管理者が注意して見る点
+3. まだ確認した方がよい不足情報
+4. 次回対応の具体案
+5. 相談者への声かけ案
+6. 今回あえてやらないこと
+7. 管理者メモ
+
+【案件情報】
+{memo}
+"""
+
+
 def page_ai_pdf():
-    st.subheader("🤖 AI要約・PDF出力")
+    st.subheader("🤖 AI要約・管理者向け対応アドバイス・PDF出力")
     case_id = select_case_widget("ai_pdf_case_select", include_closed=True)
     if not case_id:
         return
+
     memo = build_case_memo(case_id)
+    advice = build_management_advice(case_id)
+    prompt = build_management_advice_prompt(case_id)
 
-    prompt = f"""あなたは、にゃんとも相談管理システムの記録整理係です。
-以下の相談メモをもとに、判断を急がせない内部要約を作成してください。
+    ai_tabs = st.tabs(["管理者向け対応アドバイス", "AI用プロンプト", "案件統合メモ", "AI要約履歴", "PDF"])
 
-【重要ルール】
-・法的判断、医療判断、不動産判断を断定しない。
-・「売るべき」「貸すべき」「施設に入るべき」などの結論を出さない。
-・事実、未確定、保留、次回確認事項を分ける。
-・相談者を責めない。
-・家族間の温度差を対立として煽らない。
-・猫、住まい、人の暮らしを分断せずに整理する。
-・最後に「次回確認すること」を3つ以内で出す。
+    with ai_tabs[0]:
+        st.caption("案件ごとの現時点情報をもとに、にゃんとも事業の方針に沿って管理者向けの対応案を自動整理します。")
+        st.warning("この出力は判断代行ではありません。相談者へそのまま渡さず、管理者が確認してから使用してください。")
+        st.text_area("管理者向け対応アドバイス案", advice, height=620)
 
-【相談メモ】
-{memo}
-"""
-    st.text_area("案件統合メモ", memo, height=420)
-    st.text_area("AIに貼り付ける用プロンプト", prompt, height=420)
-    st.warning("個人情報を外部AIへ入力する場合は、匿名化・伏せ字化してから使用してください。")
+        with st.form(f"save_auto_advice_{case_id}"):
+            note = st.text_area("保存時メモ", placeholder="例：次回面談前に確認、家族温度差に注意 など")
+            submitted = st.form_submit_button("この対応アドバイス案をAI履歴に保存", disabled=not has_perm("ai"))
+            if submitted:
+                c = get_case_full(case_id)
+                execute("""
+                    INSERT INTO ai_summaries(summary_id, case_id, client_id, created_at, created_by,
+                                             summary_type, source_memo, ai_prompt, ai_result, note)
+                    VALUES(:summary_id, :case_id, :client_id, :created_at, :created_by,
+                           :summary_type, :source_memo, :ai_prompt, :ai_result, :note)
+                """, {
+                    "summary_id": make_id("ai"),
+                    "case_id": case_id,
+                    "client_id": c["client_id"],
+                    "created_at": now_text(),
+                    "created_by": (current_user() or {}).get("username", ""),
+                    "summary_type": "管理者向け対応アドバイス",
+                    "source_memo": memo,
+                    "ai_prompt": prompt,
+                    "ai_result": advice,
+                    "note": note,
+                })
+                add_audit_log("save_management_advice", "case", case_id, "管理者向け対応アドバイス保存")
+                st.success("対応アドバイス案をAI履歴に保存しました。")
+                st.rerun()
 
-    st.markdown("### AI要約履歴")
-    c = get_case_full(case_id)
-    with st.form(f"ai_summary_save_{case_id}"):
-        summary_type = st.selectbox("要約種別", ["内部整理", "相談者向け要約", "家族共有用", "次回確認用", "その他"])
-        ai_result = st.text_area("AIで作成した要約を貼り付け", height=220)
-        note = st.text_area("補足メモ")
-        submitted = st.form_submit_button("AI要約履歴を保存", disabled=not has_perm("ai"))
-        if submitted:
-            execute("""
-                INSERT INTO ai_summaries(summary_id, case_id, client_id, created_at, created_by,
-                                         summary_type, source_memo, ai_prompt, ai_result, note)
-                VALUES(:summary_id, :case_id, :client_id, :created_at, :created_by,
-                       :summary_type, :source_memo, :ai_prompt, :ai_result, :note)
-            """, {
-                "summary_id": make_id("ai"),
-                "case_id": case_id,
-                "client_id": c["client_id"],
-                "created_at": now_text(),
-                "created_by": (current_user() or {}).get("username", ""),
-                "summary_type": summary_type,
-                "source_memo": memo,
-                "ai_prompt": prompt,
-                "ai_result": ai_result,
-                "note": note,
-            })
-            add_audit_log("save_ai_summary", "case", case_id, summary_type)
-            st.success("AI要約履歴を保存しました。")
-            st.rerun()
+    with ai_tabs[1]:
+        st.caption("外部AIに貼り付ける場合のプロンプトです。個人情報は必要に応じて伏せてください。")
+        st.text_area("管理者向け対応アドバイス生成プロンプト", prompt, height=620)
 
-    hist = fetch_df("SELECT created_at, created_by, summary_type, ai_result, note, summary_id FROM ai_summaries WHERE case_id=:case_id ORDER BY created_at DESC", {"case_id": case_id})
-    st.dataframe(hist, use_container_width=True)
+        st.markdown("### 外部AIの回答を保存")
+        with st.form(f"save_external_ai_advice_{case_id}"):
+            summary_type = st.selectbox("保存種別", ["外部AI対応アドバイス", "内部整理", "相談者向け要約", "家族共有用", "次回確認用", "その他"])
+            ai_result = st.text_area("外部AIで作成した文章を貼り付け", height=260)
+            note = st.text_area("補足メモ")
+            submitted = st.form_submit_button("外部AI結果を履歴保存", disabled=not has_perm("ai"))
+            if submitted:
+                c = get_case_full(case_id)
+                execute("""
+                    INSERT INTO ai_summaries(summary_id, case_id, client_id, created_at, created_by,
+                                             summary_type, source_memo, ai_prompt, ai_result, note)
+                    VALUES(:summary_id, :case_id, :client_id, :created_at, :created_by,
+                           :summary_type, :source_memo, :ai_prompt, :ai_result, :note)
+                """, {
+                    "summary_id": make_id("ai"),
+                    "case_id": case_id,
+                    "client_id": c["client_id"],
+                    "created_at": now_text(),
+                    "created_by": (current_user() or {}).get("username", ""),
+                    "summary_type": summary_type,
+                    "source_memo": memo,
+                    "ai_prompt": prompt,
+                    "ai_result": ai_result,
+                    "note": note,
+                })
+                add_audit_log("save_external_ai_advice", "case", case_id, summary_type)
+                st.success("AI結果を履歴保存しました。")
+                st.rerun()
 
-    st.download_button("PDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_memo_{case_id}.pdf", mime="application/pdf")
+    with ai_tabs[2]:
+        st.text_area("案件統合メモ", memo, height=620)
+
+    with ai_tabs[3]:
+        hist = fetch_df("""
+            SELECT created_at, created_by, summary_type, ai_result, note, summary_id
+            FROM ai_summaries
+            WHERE case_id=:case_id
+            ORDER BY created_at DESC
+        """, {"case_id": case_id})
+        st.dataframe(hist, use_container_width=True)
+        if not hist.empty:
+            selected = st.selectbox(
+                "内容を確認する履歴",
+                [f"{r['created_at']}｜{r['summary_type']}｜{r['summary_id']}" for _, r in hist.iterrows()],
+                key=f"ai_hist_select_{case_id}"
+            )
+            summary_id = selected_id_from_label(selected)
+            row = fetch_one("SELECT * FROM ai_summaries WHERE summary_id=:summary_id", {"summary_id": summary_id})
+            if row:
+                st.text_area("保存済みAI結果", row.get("ai_result", ""), height=420)
+                st.text_area("保存時メモ", row.get("note", ""), height=120)
+
+    with ai_tabs[4]:
+        st.download_button("案件統合メモPDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_memo_{case_id}.pdf", mime="application/pdf")
+        st.download_button("管理者向け対応アドバイスPDFをダウンロード", make_pdf_bytes(advice), file_name=f"nyantomo_advice_{case_id}.pdf", mime="application/pdf")
 
 
 def page_search_update_delete():
@@ -2144,7 +2371,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.1（権限・AI履歴・LINE連携準備版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.2（AI対応アドバイス版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
@@ -2168,7 +2395,7 @@ tabs = st.tabs([
     "🐈 猫情報カード",
     "👪 家族関係メモ",
     "📷 写真管理",
-    "🤖 AI/PDF",
+    "🤖 AI助言/PDF",
     "🔎 検索・更新・削除",
     "📦 データ管理",
     "🔐 権限管理",
