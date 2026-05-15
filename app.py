@@ -156,6 +156,47 @@ def selected_id_from_label(label):
     return label.split("｜")[-1]
 
 
+
+
+def get_client_name_by_id(data, client_id):
+    clients_df = data.get("clients", pd.DataFrame())
+    if clients_df.empty or "client_id" not in clients_df.columns:
+        return ""
+    matched = clients_df[clients_df["client_id"].astype(str) == str(client_id)]
+    if matched.empty:
+        return ""
+    return str(matched.iloc[0].get("お名前", "")).strip()
+
+
+def find_duplicate_active_cases_by_client_name(data, client_id):
+    """同じ相談者名の未終了案件がある場合、案件の二重登録を防ぐ。"""
+    client_name = get_client_name_by_id(data, client_id)
+    if not client_name:
+        return pd.DataFrame()
+
+    clients_df = data.get("clients", pd.DataFrame())
+    cases_df = data.get("cases", pd.DataFrame())
+    if clients_df.empty or cases_df.empty:
+        return pd.DataFrame()
+
+    same_name_clients = clients_df[clients_df["お名前"].astype(str).str.strip() == client_name]
+    same_client_ids = same_name_clients["client_id"].astype(str).tolist()
+    dup = cases_df[
+        (cases_df["client_id"].astype(str).isin(same_client_ids))
+        & (cases_df["現在ステータス"].astype(str) != "終了")
+    ].copy()
+
+    if dup.empty:
+        return dup
+
+    dup = dup.merge(
+        clients_df[["client_id", "お名前", "地域"]],
+        on="client_id",
+        how="left"
+    )
+    return dup
+
+
 def build_case_memo(data, case_id):
     case_df = data["cases"][data["cases"]["case_id"] == case_id]
     if case_df.empty:
@@ -1031,7 +1072,7 @@ def render_case_dashboard(data):
 
 data = load_all()
 
-st.title("🐾 にゃんとも相談管理システム Ver1.6（案件選択改善版）")
+st.title("🐾 にゃんとも相談管理システム Ver1.6（重複登録防止版）")
 st.caption("相談を保留のまま管理する現場OS｜案件起点・次アクション・入力不足チェック対応版")
 
 tabs = st.tabs([
@@ -1106,6 +1147,14 @@ with tabs[2]:
             selected_client_label = st.selectbox("相談者を選択", client_labels)
             client_id = selected_id_from_label(selected_client_label)
 
+            duplicate_cases_preview = find_duplicate_active_cases_by_client_name(data, client_id)
+            if not duplicate_cases_preview.empty:
+                st.warning("この相談者名では、すでに終了していない案件が登録されています。二重登録防止のため、新規案件登録はできません。既存案件の『案件ダッシュボード』または『相談履歴』から追記してください。")
+                st.dataframe(
+                    duplicate_cases_preview[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
+                    use_container_width=True
+                )
+
             col1, col2 = st.columns(2)
             with col1:
                 consult_date = st.date_input("相談日", value=date.today())
@@ -1142,6 +1191,15 @@ with tabs[2]:
             submitted = st.form_submit_button("案件を登録")
 
             if submitted:
+                duplicate_cases = find_duplicate_active_cases_by_client_name(data, client_id)
+                if not duplicate_cases.empty:
+                    st.error("登録できません。同じ相談者名で、終了していない案件がすでにあります。既存案件に履歴を追加してください。")
+                    st.dataframe(
+                        duplicate_cases[["お名前", "地域", "案件名", "案件種別", "現在ステータス", "相談日", "case_id"]],
+                        use_container_width=True
+                    )
+                    st.stop()
+
                 case_id = make_id("case")
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
