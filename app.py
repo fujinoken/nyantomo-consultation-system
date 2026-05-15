@@ -21,7 +21,7 @@ from reportlab.pdfbase import pdfmetrics
 
 
 # =========================================================
-# にゃんとも相談管理システム Ver2.2.2 更新機能強化版
+# にゃんとも相談管理システム Ver2.2.3 LINE履歴表示強化版
 # ---------------------------------------------------------
 # 方針：
 # ・client_id / case_id を正式な主キーとして管理
@@ -1607,9 +1607,16 @@ def page_case_dashboard():
                     st.success("案件を終了しました。")
                     st.rerun()
 
+    line_count_row = fetch_one("SELECT COUNT(*) AS cnt FROM line_messages WHERE case_id=:case_id", {"case_id": case_id})
+    latest_line = fetch_one("SELECT created_at, send_status FROM line_messages WHERE case_id=:case_id ORDER BY created_at DESC LIMIT 1", {"case_id": case_id})
+    if latest_line:
+        st.info(f"LINE履歴：{line_count_row.get('cnt', 0)}件 ／ 最新：{latest_line.get('created_at','')}（{latest_line.get('send_status','')}）")
+    else:
+        st.info("LINE履歴：未登録")
+
     st.divider()
     st.markdown("### この案件に紐づくデータ")
-    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "AI/PDF用メモ", "管理者アドバイス"])
+    rel_tabs = st.tabs(["相談者", "相談履歴", "空き家", "猫", "家族", "写真", "LINE履歴", "AI/PDF用メモ", "管理者アドバイス"])
 
     with rel_tabs[0]:
         st.dataframe(fetch_df("SELECT * FROM clients WHERE client_id=:client_id", {"client_id": c["client_id"]}), use_container_width=True)
@@ -1643,11 +1650,48 @@ def page_case_dashboard():
                     st.image(str(path), width=350)
 
     with rel_tabs[6]:
+        line_df = fetch_df("""
+            SELECT
+                created_at AS 送信時,
+                created_by AS 作成者,
+                to_target AS 送信先ID,
+                send_status AS 送信状態,
+                message_text AS 送信文,
+                response_memo AS 反応メモ,
+                message_id
+            FROM line_messages
+            WHERE case_id=:case_id
+            ORDER BY created_at DESC
+        """, {"case_id": case_id})
+
+        if line_df.empty:
+            st.info("この案件のLINE送信履歴はまだありません。")
+        else:
+            st.dataframe(line_df, use_container_width=True)
+            selected_line = st.selectbox(
+                "送信文を確認する履歴",
+                [
+                    f"{r['送信時']}｜{r['送信状態']}｜{r['message_id']}"
+                    for _, r in line_df.iterrows()
+                ],
+                key=f"dash_line_history_select_{case_id}"
+            )
+            message_id = selected_id_from_label(selected_line)
+            line_row = fetch_one("SELECT * FROM line_messages WHERE message_id=:message_id", {"message_id": message_id})
+            if line_row:
+                st.markdown("#### 送信内容")
+                st.write(f"**送信時：** {line_row.get('created_at','')}")
+                st.write(f"**送信状態：** {line_row.get('send_status','')}")
+                st.write(f"**送信先ID：** {line_row.get('to_target','')}")
+                st.text_area("送信文", line_row.get("message_text", ""), height=220, key=f"dash_line_text_{message_id}")
+                st.text_area("反応メモ", line_row.get("response_memo", ""), height=120, key=f"dash_line_response_{message_id}")
+
+    with rel_tabs[7]:
         memo = build_case_memo(case_id)
         st.text_area("案件統合メモ", memo, height=500)
         st.download_button("この案件のPDFをダウンロード", make_pdf_bytes(memo), file_name=f"nyantomo_case_{case_id}.pdf", mime="application/pdf")
 
-    with rel_tabs[7]:
+    with rel_tabs[8]:
         advice = build_management_advice(case_id)
         st.text_area("管理者向け対応アドバイス案", advice, height=500)
         st.download_button("対応アドバイスPDFをダウンロード", make_pdf_bytes(advice), file_name=f"nyantomo_advice_{case_id}.pdf", mime="application/pdf")
@@ -2195,7 +2239,7 @@ def page_ai_pdf():
 
 def page_search_update_delete():
     st.subheader("🔎 検索・更新・削除")
-    st.caption("Ver2.2.2では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
+    st.caption("Ver2.2.3では、SQLiteの各テーブルを検索し、主要項目を画面から更新できます。")
 
     table_map = {
         "相談者": "clients",
@@ -2683,7 +2727,7 @@ if not current_user():
 render_top_nav()
 logout_button()
 
-st.title("🐾 にゃんとも相談管理システム Ver2.2.2（更新機能強化版）")
+st.title("🐾 にゃんとも相談管理システム Ver2.2.3（LINE履歴表示強化版）")
 st.caption("相談を保留のまま管理する現場OS｜client_id・case_idを正式な主キーとしてDB管理")
 
 # 初回だけExcel移行案内
